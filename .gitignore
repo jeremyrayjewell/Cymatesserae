@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+build/
+dist/
+*.mp4
+*.log
