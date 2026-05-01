@@ -34,10 +34,20 @@ class RenderConfig:
     morph_rate: float = 0.18
     layer_count: int = 3
     overlap: float = 0.35
+    pattern_layout: str = "flow"
+    grid_strength: float = 0.82
+    geometry_rigidity: float = 0.75
+    layer_rigidity: float = 0.55
+    tile_overlap: float = 0.25
+    grid_columns: int = 0
+    grid_rows: int = 0
+    grid_pattern: str = "rect"
+    cell_alternation: str = "none"
     reorg_mode: str = "burst"
     graphic_cycle: tuple[str, ...] = ("voronoi", "circles", "scribbles", "lines", "geometrics")
     beats_per_switch: int = 4
     chroma_key_color: tuple[int, int, int] | None = None
+    custom_element_paths: tuple[Path, ...] = ()
 
 
 @dataclass(slots=True)
@@ -220,7 +230,8 @@ STYLE_PRESETS: dict[str, StylePreset] = {
     ),
 }
 
-GRAPHIC_TYPES = ("voronoi", "circles", "scribbles", "lines", "geometrics")
+GRAPHIC_TYPES = ("voronoi", "circles", "scribbles", "lines", "geometrics", "custom")
+CUSTOM_ELEMENT_KEY = (255, 0, 255)
 
 
 def _get_librosa():
@@ -530,6 +541,72 @@ def _build_seed_points(count: int, width: int, height: int, rng: np.random.Gener
     return pts
 
 
+def _resolve_grid_dimensions(count: int, width: int, height: int, grid_columns: int = 0, grid_rows: int = 0) -> tuple[int, int, int]:
+    cols = max(0, int(grid_columns))
+    rows = max(0, int(grid_rows))
+    explicit_grid = cols > 0 and rows > 0
+    if cols == 0 and rows == 0:
+        cols = max(1, int(np.sqrt(count * width / max(height, 1))))
+        rows = int(np.ceil(count / max(cols, 1)))
+    elif cols == 0:
+        cols = int(np.ceil(count / max(rows, 1)))
+    elif rows == 0:
+        rows = int(np.ceil(count / max(cols, 1)))
+
+    cols = max(1, cols)
+    rows = max(1, rows)
+    if explicit_grid:
+        count = cols * rows
+    else:
+        count = min(count, cols * rows)
+    return cols, rows, count
+
+
+def _build_grid_points(
+    count: int,
+    width: int,
+    height: int,
+    overlap: float,
+    grid_columns: int = 0,
+    grid_rows: int = 0,
+    grid_pattern: str = "rect",
+) -> np.ndarray:
+    cols, rows, count = _resolve_grid_dimensions(count, width, height, grid_columns, grid_rows)
+    edge_x = 0.0 if cols <= 1 else 8.0 / max(width, 1)
+    edge_y = 0.0 if rows <= 1 else 8.0 / max(height, 1)
+    xs = np.linspace(edge_x, 1.0 - edge_x, cols, dtype=np.float32)
+    ys = np.linspace(edge_y, 1.0 - edge_y, rows, dtype=np.float32)
+    grid = np.array(np.meshgrid(xs, ys), dtype=np.float32).reshape(2, -1).T[:count]
+    step_x = 0.0 if cols <= 1 else float(xs[1] - xs[0])
+    step_y = 0.0 if rows <= 1 else float(ys[1] - ys[0])
+
+    if grid_pattern == "brick" and rows > 1 and cols > 1:
+        row_indices = np.repeat(np.arange(rows, dtype=np.int32), cols)[:count]
+        grid[:, 0] += (row_indices % 2) * (step_x * 0.5)
+        grid[:, 0] = np.clip(grid[:, 0], edge_x, 1.0 - edge_x)
+    elif grid_pattern == "hex" and rows > 1 and cols > 1:
+        row_indices = np.repeat(np.arange(rows, dtype=np.int32), cols)[:count]
+        grid[:, 0] += (row_indices % 2) * (step_x * 0.5)
+        grid[:, 0] = np.clip(grid[:, 0], edge_x, 1.0 - edge_x)
+        center = np.array([0.5, 0.5], dtype=np.float32)
+        grid = center + (grid - center) * np.array([1.0, 0.92], dtype=np.float32)
+    elif grid_pattern == "diamond":
+        center = np.array([0.5, 0.5], dtype=np.float32)
+        shifted = grid - center
+        diamond = np.empty_like(shifted)
+        diamond[:, 0] = shifted[:, 0] + shifted[:, 1] * 0.45
+        diamond[:, 1] = shifted[:, 1] + shifted[:, 0] * 0.45
+        mins = diamond.min(axis=0)
+        maxs = diamond.max(axis=0)
+        spans = np.maximum(maxs - mins, 1e-6)
+        diamond[:, 0] = edge_x + (diamond[:, 0] - mins[0]) * ((1.0 - edge_x * 2.0) / spans[0])
+        diamond[:, 1] = edge_y + (diamond[:, 1] - mins[1]) * ((1.0 - edge_y * 2.0) / spans[1])
+        grid = diamond
+    grid[:, 0] *= width
+    grid[:, 1] *= height
+    return grid.astype(np.float32)
+
+
 def _cymatic_force(points: np.ndarray, width: int, height: int, mode: tuple[int, int], strength: float) -> np.ndarray:
     m, n = mode
     unit = np.empty_like(points, dtype=np.float32)
@@ -573,24 +650,85 @@ def _prepare_layers(
     layer_count: int,
     overlap: float,
     time_phase: float,
+    pattern_layout: str = "flow",
+    layer_rigidity: float = 0.0,
 ) -> list[np.ndarray]:
     layers: list[np.ndarray] = []
     center = np.array([points[:, 0].mean(), points[:, 1].mean()], dtype=np.float32)
     delta = points - center
     count = max(1, layer_count)
+    rigid_mix = np.clip(layer_rigidity, 0.0, 1.0) if pattern_layout == "grid" else 0.0
     for idx in range(count):
         layer_t = 0.0 if count == 1 else idx / (count - 1)
         offset_angle = time_phase * 0.045 + layer_t * math.tau * 0.6 + snapshot.brightness * 1.6
         offset_vec = np.array([math.cos(offset_angle), math.sin(offset_angle)], dtype=np.float32)
         offset_mag = style.layer_spread * overlap * (0.4 + layer_t) * (0.8 + snapshot.percussive_flux * 0.9)
-        pulse = 1.0 + (layer_t - 0.5) * style.pulse_gain * snapshot.bass * 0.22
+        offset_mag *= 1.0 - rigid_mix * 0.92
+        pulse = 1.0 + (layer_t - 0.5) * style.pulse_gain * snapshot.bass * 0.22 * (1.0 - rigid_mix * 0.9)
         shear = np.empty_like(points, dtype=np.float32)
-        shear[:, 0] = delta[:, 0] + delta[:, 1] * 0.08 * overlap * (idx + 1)
-        shear[:, 1] = delta[:, 1] - delta[:, 0] * 0.06 * overlap * (idx + 1)
+        shear_gain_x = 0.08 * overlap * (idx + 1) * (1.0 - rigid_mix * 0.95)
+        shear_gain_y = 0.06 * overlap * (idx + 1) * (1.0 - rigid_mix * 0.95)
+        shear[:, 0] = delta[:, 0] + delta[:, 1] * shear_gain_x
+        shear[:, 1] = delta[:, 1] - delta[:, 0] * shear_gain_y
         layer_points = center + shear * pulse
         layer_points += offset_vec * offset_mag * style.offset_gain
+        if rigid_mix > 0.0:
+            layer_points = points * rigid_mix + layer_points * (1.0 - rigid_mix)
         layers.append(layer_points.astype(np.float32))
     return layers
+
+
+def _estimate_grid_cell_span(points: np.ndarray, width: int, height: int) -> tuple[float, float]:
+    if len(points) <= 1:
+        return float(width), float(height)
+
+    def _axis_span(values: np.ndarray, fallback: float) -> float:
+        rounded = np.unique(np.round(values, 3))
+        if len(rounded) <= 1:
+            return fallback
+        diffs = np.diff(np.sort(rounded))
+        positive = diffs[diffs > 1e-3]
+        if len(positive) == 0:
+            return fallback
+        return float(np.min(positive))
+
+    span_x = _axis_span(points[:, 0], float(width))
+    span_y = _axis_span(points[:, 1], float(height))
+    return span_x, span_y
+
+
+def _grid_cell_span_from_dimensions(width: int, height: int, cols: int, rows: int) -> tuple[float, float]:
+    if cols <= 1:
+        span_x = float(width - 16)
+    else:
+        span_x = float((width - 16) / max(cols - 1, 1))
+    if rows <= 1:
+        span_y = float(height - 16)
+    else:
+        span_y = float((height - 16) / max(rows - 1, 1))
+    return max(span_x, 8.0), max(span_y, 8.0)
+
+
+def _load_custom_elements(custom_element_paths: tuple[Path, ...]) -> list[pygame.Surface]:
+    sprites: list[pygame.Surface] = []
+    for custom_element_path in custom_element_paths:
+        if not custom_element_path.exists():
+            raise FileNotFoundError(f"Custom element file not found: {custom_element_path}")
+        sprite = pygame.image.load(custom_element_path.as_posix()).convert()
+        sprite.set_colorkey(CUSTOM_ELEMENT_KEY)
+        sprites.append(sprite)
+    return sprites
+
+
+def _invert_custom_surface(surface: pygame.Surface) -> pygame.Surface:
+    inverted = surface.copy()
+    rgb = pygame.surfarray.array3d(inverted)
+    key = np.asarray(CUSTOM_ELEMENT_KEY, dtype=np.uint8)
+    mask = np.any(rgb != key[None, None, :], axis=2)
+    rgb[mask] = 255 - rgb[mask]
+    pygame.surfarray.blit_array(inverted, rgb)
+    inverted.set_colorkey(CUSTOM_ELEMENT_KEY)
+    return inverted
 
 
 def _circle_radius(style: ActiveStyle, snapshot: AudioSnapshot, beat_pulse: float, layer_weight: float, width: int) -> int:
@@ -724,6 +862,70 @@ def _draw_geometrics(
             pygame.draw.polygon(surface, border_color, tri.tolist(), 1)
 
 
+def _draw_custom(
+    surface: pygame.Surface,
+    layers: list[np.ndarray],
+    snapshot: AudioSnapshot,
+    beat_pulse: float,
+    time_phase: float,
+    custom_elements: list[pygame.Surface],
+    pattern_layout: str,
+    geometry_rigidity: float,
+    tile_overlap: float,
+    grid_cell_span: tuple[float, float] | None,
+    grid_columns: int,
+    cell_alternation: str,
+) -> None:
+    if not custom_elements:
+        return
+    count = max(1, len(layers))
+    rigid_mix = np.clip(geometry_rigidity, 0.0, 1.0) if pattern_layout == "grid" else 0.0
+    for layer_idx, layer_points in enumerate(layers):
+        layer_weight = 0.0 if count == 1 else layer_idx / (count - 1)
+        step = 1 if pattern_layout == "grid" else max(1, len(layer_points) // max(14, int(36 - tile_overlap * 20)))
+        if pattern_layout == "grid" and grid_cell_span is not None:
+            cell_span_x, cell_span_y = grid_cell_span
+        else:
+            cell_span_x, cell_span_y = _estimate_grid_cell_span(layer_points, surface.get_width(), surface.get_height())
+        fit_ratio = 0.92 + tile_overlap * 0.35
+        target_w = max(8.0, cell_span_x * fit_ratio)
+        target_h = max(8.0, cell_span_y * fit_ratio)
+        for idx, point in enumerate(layer_points[::step]):
+            point_index = idx * step
+            sprite = custom_elements[(point_index + layer_idx) % len(custom_elements)]
+            parity = 0
+            if pattern_layout == "grid" and grid_columns > 0:
+                row_idx = point_index // grid_columns
+                col_idx = point_index % grid_columns
+                parity = (row_idx + col_idx) % 2
+            if pattern_layout == "grid":
+                sprite_w = max(float(sprite.get_width()), 1.0)
+                sprite_h = max(float(sprite.get_height()), 1.0)
+                fit_scale = min(target_w / sprite_w, target_h / sprite_h)
+                audio_breath = 1.0 + snapshot.bass * 0.10 + beat_pulse * 0.08
+                scale = fit_scale * (0.96 + (audio_breath - 1.0) * (1.0 - rigid_mix * 0.35))
+                width = sprite_w * scale
+                height = sprite_h * scale
+            else:
+                scale = 0.65 + snapshot.bass * 1.0 + beat_pulse * 0.7 + layer_weight * 0.38 + tile_overlap * 0.30
+                width = sprite.get_width() * scale
+                height = sprite.get_height() * scale
+            width = max(8, int(width))
+            height = max(8, int(height))
+            sprite_source = sprite
+            if parity == 1 and cell_alternation in {"color", "both"}:
+                sprite_source = _invert_custom_surface(sprite_source)
+            scaled = pygame.transform.scale(sprite_source, (width, height))
+            if parity == 1 and cell_alternation in {"orientation", "both"}:
+                scaled = pygame.transform.flip(scaled, True, True)
+            angle = (time_phase * 32.0 + idx * 11.0 + layer_idx * 16.0) * (0.35 + snapshot.brightness * 0.5)
+            if pattern_layout == "grid":
+                angle *= 1.0 - rigid_mix
+            rotated = pygame.transform.rotate(scaled, angle)
+            rect = rotated.get_rect(center=(int(point[0]), int(point[1])))
+            surface.blit(rotated, rect)
+
+
 def _draw_voronoi_layer(
     surface: pygame.Surface,
     points: np.ndarray,
@@ -792,6 +994,13 @@ def _draw_graphic_family(
     overlap: float,
     time_phase: float,
     chroma_key_color: tuple[int, int, int] | None,
+    custom_elements: list[pygame.Surface],
+    pattern_layout: str,
+    geometry_rigidity: float,
+    tile_overlap: float,
+    grid_cell_span: tuple[float, float] | None,
+    grid_columns: int,
+    cell_alternation: str,
 ) -> None:
     if family == "circles":
         _draw_circles(surface, layers, style, snapshot, style_mix, beat_pulse, chroma_key_color)
@@ -804,6 +1013,22 @@ def _draw_graphic_family(
         return
     if family == "geometrics":
         _draw_geometrics(surface, layers, style, snapshot, style_mix, beat_pulse, time_phase, chroma_key_color)
+        return
+    if family == "custom":
+        _draw_custom(
+            surface,
+            layers,
+            snapshot,
+            beat_pulse,
+            time_phase,
+            custom_elements,
+            pattern_layout,
+            geometry_rigidity,
+            tile_overlap,
+            grid_cell_span,
+            grid_columns,
+            cell_alternation,
+        )
         return
 
     for layer_idx, layer_points in enumerate(layers):
@@ -921,8 +1146,25 @@ def render_project(config: RenderConfig) -> None:
     )
     total_frames = max(1, math.ceil(timeline.duration * config.fps))
     rng = np.random.default_rng(config.seed)
-    points = _build_seed_points(config.point_count, config.width, config.height, rng)
+    is_grid_layout = config.pattern_layout == "grid"
+    geometry_rigidity = float(np.clip(config.geometry_rigidity, 0.0, 1.0))
+    layer_rigidity = float(np.clip(config.layer_rigidity, 0.0, 1.0))
+    if is_grid_layout:
+        grid_cols, grid_rows, _ = _resolve_grid_dimensions(config.point_count, config.width, config.height, config.grid_columns, config.grid_rows)
+        points = _build_grid_points(
+            config.point_count,
+            config.width,
+            config.height,
+            config.tile_overlap,
+            config.grid_columns,
+            config.grid_rows,
+            config.grid_pattern,
+        )
+    else:
+        grid_cols, grid_rows = 0, 0
+        points = _build_seed_points(config.point_count, config.width, config.height, rng)
     base_points = points.copy()
+    grid_cell_span = _grid_cell_span_from_dimensions(config.width, config.height, grid_cols, grid_rows) if is_grid_layout else None
     velocity = np.zeros_like(points, dtype=np.float32)
 
     style_a = _resolve_style(config.style_a)
@@ -939,6 +1181,7 @@ def render_project(config: RenderConfig) -> None:
     ffmpeg = _open_ffmpeg(config.output_path, config.audio_path, config.width, config.height, config.fps)
     if ffmpeg.stdin is None:
         raise RuntimeError("Failed to open FFmpeg stdin.")
+    custom_elements = _load_custom_elements(config.custom_element_paths)
 
     try:
         previous_onset = 0.0
@@ -967,8 +1210,9 @@ def render_project(config: RenderConfig) -> None:
                 velocity += _cymatic_force(points, config.width, config.height, config.plate_mode, cymatic_strength)
 
             if trigger:
-                velocity += _reorg_impulse(config, rng, points, snapshot)
-                base_points = _rebuild_bases(config, rng, points, base_points)
+                if not is_grid_layout:
+                    velocity += _reorg_impulse(config, rng, points, snapshot)
+                    base_points = _rebuild_bases(config, rng, points, base_points)
 
             center = np.array([config.width * 0.5, config.height * 0.5], dtype=np.float32)
             delta = points - center
@@ -981,17 +1225,41 @@ def render_project(config: RenderConfig) -> None:
             drift_wave[:, 0] = np.sin(points[:, 1] * 0.012 + time_phase * 1.8)
             drift_wave[:, 1] = np.cos(points[:, 0] * 0.012 - time_phase * 1.5)
 
-            velocity += swirl * (0.03 + snapshot.brightness * 0.12 + style.swirl_bias + snapshot.harmonic_ratio * 0.08)
-            velocity += drift_wave * (config.overlap * 0.10 + snapshot.contrast * 0.06)
-            velocity *= 0.90 - snapshot.rms * 0.08
+            if is_grid_layout:
+                grid_pull = np.clip(config.grid_strength, 0.0, 1.0)
+                rigidity_pull = 0.10 + geometry_rigidity * 0.50 + grid_pull * 0.22 + config.tile_overlap * 0.04
+                velocity += (base_points - points) * rigidity_pull
+                velocity += swirl * (0.004 + snapshot.brightness * 0.012 + style.swirl_bias * 0.08) * (1.0 - geometry_rigidity)
+                velocity += drift_wave * (0.008 + config.tile_overlap * 0.020 + snapshot.contrast * 0.015) * (1.0 - geometry_rigidity)
+                velocity *= max(0.12, 0.58 - snapshot.rms * 0.04 - grid_pull * 0.16 - geometry_rigidity * 0.28)
+            else:
+                velocity += swirl * (0.03 + snapshot.brightness * 0.12 + style.swirl_bias + snapshot.harmonic_ratio * 0.08)
+                velocity += drift_wave * (config.overlap * 0.10 + snapshot.contrast * 0.06)
+                velocity *= 0.90 - snapshot.rms * 0.08
 
             points += velocity
+            if is_grid_layout:
+                snap_mix = geometry_rigidity
+                if snap_mix > 0.0:
+                    points = base_points * snap_mix + points * (1.0 - snap_mix)
+                if geometry_rigidity >= 0.995:
+                    points = base_points.copy()
+                    velocity.fill(0.0)
             points[:, 0] = np.clip(points[:, 0], 8.0, config.width - 8.0)
             points[:, 1] = np.clip(points[:, 1], 8.0, config.height - 8.0)
 
-            family_overlap = config.overlap + beat_pulse * 0.18
+            family_overlap = config.overlap + beat_pulse * 0.18 + config.tile_overlap * 0.10
             _frame_background(surface, style, snapshot, style_mix, time_phase, config.chroma_key_color)
-            layers = _prepare_layers(points, style, snapshot, config.layer_count, family_overlap, time_phase)
+            layers = _prepare_layers(
+                points,
+                style,
+                snapshot,
+                config.layer_count,
+                family_overlap,
+                time_phase,
+                config.pattern_layout,
+                layer_rigidity,
+            )
             _draw_graphic_family(
                 surface,
                 graphic_family,
@@ -1003,6 +1271,13 @@ def render_project(config: RenderConfig) -> None:
                 family_overlap,
                 time_phase,
                 config.chroma_key_color,
+                custom_elements,
+                config.pattern_layout,
+                geometry_rigidity,
+                config.tile_overlap,
+                grid_cell_span,
+                grid_cols,
+                config.cell_alternation,
             )
 
             if config.preview:

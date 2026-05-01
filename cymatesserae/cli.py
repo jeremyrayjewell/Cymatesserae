@@ -18,6 +18,21 @@ def parse_chroma_key_color(value: str) -> tuple[int, int, int]:
         raise argparse.ArgumentTypeError("Chroma key color must be valid hexadecimal.") from exc
 
 
+def normalize_output_path(path: Path) -> Path:
+    if path.suffix.lower() == ".mp4":
+        return path
+    if path.suffix:
+        return path.with_suffix(".mp4")
+    return path.with_name(f"{path.name}.mp4")
+
+
+def normalize_video_dimension(value: int) -> int:
+    number = max(2, int(value))
+    if number % 2 == 0:
+        return number
+    return number + 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cymatesserae",
@@ -117,6 +132,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="Amount of spatial overlap and echo between layers.",
     )
     parser.add_argument(
+        "--pattern-layout",
+        default="flow",
+        choices=["flow", "grid"],
+        help="Whether patterns move freely or stay more locked to a grid.",
+    )
+    parser.add_argument(
+        "--grid-strength",
+        type=float,
+        default=0.82,
+        help="How strongly grid layout resists drift and stays stationary.",
+    )
+    parser.add_argument(
+        "--geometry-rigidity",
+        type=float,
+        default=0.75,
+        help="How rigidly points lock to their grid positions in grid layout.",
+    )
+    parser.add_argument(
+        "--layer-rigidity",
+        type=float,
+        default=0.55,
+        help="How much overlapping layers resist shear, offset, and pulse in grid layout.",
+    )
+    parser.add_argument(
+        "--tile-overlap",
+        type=float,
+        default=0.25,
+        help="How tightly grid and custom elements overlap when using stationary layouts.",
+    )
+    parser.add_argument(
+        "--grid-columns",
+        type=int,
+        default=0,
+        help="Optional explicit number of grid columns when using grid layout. Use 0 to auto-fit.",
+    )
+    parser.add_argument(
+        "--grid-rows",
+        type=int,
+        default=0,
+        help="Optional explicit number of grid rows when using grid layout. Use 0 to auto-fit.",
+    )
+    parser.add_argument(
+        "--grid-pattern",
+        default="rect",
+        choices=["rect", "brick", "hex", "diamond"],
+        help="Cell arrangement to use when pattern layout is grid.",
+    )
+    parser.add_argument(
+        "--cell-alternation",
+        default="none",
+        choices=["none", "orientation", "color", "both"],
+        help="Alternate inverse orientation and/or inverse color across grid cells.",
+    )
+    parser.add_argument(
         "--reorg-mode",
         default="burst",
         choices=["burst", "swirl", "split", "shockwave"],
@@ -139,6 +208,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional solid background color for chroma keying, as RRGGBB or #RRGGBB.",
     )
+    parser.add_argument(
+        "--custom-element",
+        type=Path,
+        nargs="+",
+        default=None,
+        help="One or more painted sprite assets used by the custom graphic family.",
+    )
     return parser
 
 
@@ -155,9 +231,9 @@ def main() -> int:
 
     config = RenderConfig(
         audio_path=args.audio,
-        output_path=args.output,
-        width=args.width,
-        height=args.height,
+        output_path=normalize_output_path(args.output),
+        width=normalize_video_dimension(args.width),
+        height=normalize_video_dimension(args.height),
         fps=args.fps,
         point_count=args.points,
         preview=args.preview,
@@ -172,10 +248,20 @@ def main() -> int:
         morph_rate=args.morph_rate,
         layer_count=args.layers,
         overlap=args.overlap,
+        pattern_layout=args.pattern_layout,
+        grid_strength=args.grid_strength,
+        geometry_rigidity=args.geometry_rigidity,
+        layer_rigidity=args.layer_rigidity,
+        tile_overlap=args.tile_overlap,
+        grid_columns=args.grid_columns,
+        grid_rows=args.grid_rows,
+        grid_pattern=args.grid_pattern,
+        cell_alternation=args.cell_alternation,
         reorg_mode=args.reorg_mode,
         graphic_cycle=tuple(part.strip() for part in args.graphic_cycle.split(",") if part.strip()),
         beats_per_switch=args.beats_per_switch,
         chroma_key_color=args.chroma_key_color,
+        custom_element_paths=tuple(args.custom_element or ()),
     )
     render_project(config)
     return 0
