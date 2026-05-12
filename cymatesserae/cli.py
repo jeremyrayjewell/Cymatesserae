@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from .renderer import RenderConfig, render_project
+if TYPE_CHECKING:
+    from .renderer import GraphicLayerConfig, RenderConfig
 
 
 def parse_chroma_key_color(value: str) -> tuple[int, int, int]:
@@ -31,6 +34,50 @@ def normalize_video_dimension(value: int) -> int:
     if number % 2 == 0:
         return number
     return number + 1
+
+
+def load_graphic_layers(path: Path | None) -> tuple[GraphicLayerConfig, ...]:
+    if path is None:
+        return ()
+    from .renderer import GraphicLayerConfig
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    layers: list[GraphicLayerConfig] = []
+    for idx, item in enumerate(raw):
+        custom_paths = tuple(Path(text) for text in item.get("custom_element_paths", []))
+        transparent_colors_raw = item.get("transparent_colors", [])
+        transparent_colors = tuple(
+            parse_chroma_key_color(str(color)) for color in transparent_colors_raw
+        ) if transparent_colors_raw else ()
+        layers.append(
+            GraphicLayerConfig(
+                name=str(item.get("name", f"layer_{idx + 1}")),
+                family=str(item.get("family", "voronoi")),
+                enabled=bool(item.get("enabled", True)),
+                opacity=float(item.get("opacity", 1.0)),
+                transparent_colors=transparent_colors,
+                graphic_cycle=tuple(str(value) for value in item.get("graphic_cycle", [])),
+                beats_per_switch=int(item.get("beats_per_switch", 4)),
+                response_gain=float(item.get("response_gain", 1.0)),
+                style_a=str(item.get("style_a", "ceramic")),
+                style_b=str(item.get("style_b", "neon")),
+                morph_rate=float(item.get("morph_rate", 0.18)),
+                layer_count=int(item.get("layer_count", 3)),
+                overlap=float(item.get("overlap", 0.35)),
+                pattern_layout=str(item.get("pattern_layout", "flow")),
+                grid_strength=float(item.get("grid_strength", 0.82)),
+                geometry_rigidity=float(item.get("geometry_rigidity", 0.75)),
+                layer_rigidity=float(item.get("layer_rigidity", 0.55)),
+                tile_overlap=float(item.get("tile_overlap", 0.25)),
+                grid_columns=int(item.get("grid_columns", 0)),
+                grid_rows=int(item.get("grid_rows", 0)),
+                grid_pattern=str(item.get("grid_pattern", "rect")),
+                cell_alternation=str(item.get("cell_alternation", "none")),
+                reorg_mode=str(item.get("reorg_mode", "burst")),
+                custom_element_paths=custom_paths,
+            )
+        )
+    return tuple(layers)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,6 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--preview",
         action="store_true",
         help="Preview the animation in a window while rendering.",
+    )
+    parser.add_argument(
+        "--preview-only",
+        action="store_true",
+        help="Open a lighter live preview window without exporting frames to FFmpeg.",
     )
     parser.add_argument(
         "--cymatic",
@@ -203,6 +255,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many beats each graphic family stays active before switching.",
     )
     parser.add_argument(
+        "--stack-interaction",
+        default="none",
+        choices=["none", "crossfade", "shuffle", "pulse", "duck", "spotlight"],
+        help="How enabled channels interact while stacked together, including audio-responsive modes.",
+    )
+    parser.add_argument(
         "--chroma-key-color",
         type=parse_chroma_key_color,
         default=None,
@@ -214,6 +272,12 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         help="One or more painted sprite assets used by the custom graphic family.",
+    )
+    parser.add_argument(
+        "--graphics-config",
+        type=Path,
+        default=None,
+        help="Optional JSON file describing per-graphic layer settings from the GUI.",
     )
     return parser
 
@@ -228,6 +292,14 @@ def main() -> int:
 
     if args.audio is None:
         raise SystemExit("Audio file is required unless you use --gui.")
+    if args.audio.name.lower() == "preview" and not args.audio.exists() and not args.preview:
+        raise SystemExit(
+            "`preview` is a flag, not a subcommand.\n"
+            "Use: python -m cymatesserae <audio-file> --preview [options]\n"
+            "Or launch the GUI with: python -m cymatesserae --gui"
+        )
+
+    from .renderer import RenderConfig, render_project
 
     config = RenderConfig(
         audio_path=args.audio,
@@ -236,7 +308,8 @@ def main() -> int:
         height=normalize_video_dimension(args.height),
         fps=args.fps,
         point_count=args.points,
-        preview=args.preview,
+        preview=args.preview or args.preview_only,
+        preview_only=args.preview_only,
         cymatic_mode=args.cymatic,
         plate_mode=tuple(args.plate_mode),
         hop_length=args.hop_length,
@@ -260,8 +333,10 @@ def main() -> int:
         reorg_mode=args.reorg_mode,
         graphic_cycle=tuple(part.strip() for part in args.graphic_cycle.split(",") if part.strip()),
         beats_per_switch=args.beats_per_switch,
+        stack_interaction=args.stack_interaction,
         chroma_key_color=args.chroma_key_color,
         custom_element_paths=tuple(args.custom_element or ()),
+        graphic_layers=load_graphic_layers(args.graphics_config),
     )
     render_project(config)
     return 0

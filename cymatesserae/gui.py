@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import json
+import math
+import re
 import subprocess
 import sys
 import tkinter as tk
@@ -13,6 +16,7 @@ REORG_OPTIONS = ("burst", "swirl", "split", "shockwave")
 PATTERN_LAYOUT_OPTIONS = ("flow", "grid")
 GRID_PATTERN_OPTIONS = ("rect", "brick", "hex", "diamond")
 CELL_ALTERNATION_OPTIONS = ("none", "orientation", "color", "both")
+STACK_INTERACTION_OPTIONS = ("none", "crossfade", "shuffle", "pulse", "duck", "spotlight")
 GRAPHIC_FAMILIES = (
     {
         "name": "voronoi",
@@ -86,6 +90,42 @@ def normalize_video_dimension(value: int) -> int:
     return number + 1
 
 
+def normalize_hex_color_text(value: str) -> str:
+    text = value.strip().lower()
+    if not text:
+        return ""
+    if text.startswith("#"):
+        text = text[1:]
+    if len(text) != 6:
+        raise ValueError("Color must be a 6-digit hex value like 00ff00.")
+    int(text, 16)
+    return text
+
+
+def _position_toplevel_near_parent(window: tk.Toplevel, parent: tk.Widget, offset_x: int = 40, offset_y: int = 40) -> None:
+    try:
+        anchor = parent.winfo_toplevel()
+        anchor.update_idletasks()
+        window.update_idletasks()
+        parent_x = anchor.winfo_rootx()
+        parent_y = anchor.winfo_rooty()
+        parent_width = anchor.winfo_width()
+        parent_height = anchor.winfo_height()
+        window_width = max(window.winfo_reqwidth(), window.winfo_width())
+        window_height = max(window.winfo_reqheight(), window.winfo_height())
+        x = parent_x + min(offset_x, max(parent_width - window_width, 0))
+        y = parent_y + min(offset_y, max(parent_height - window_height, 0))
+        vroot_x = anchor.winfo_vrootx()
+        vroot_y = anchor.winfo_vrooty()
+        vroot_width = anchor.winfo_vrootwidth()
+        vroot_height = anchor.winfo_vrootheight()
+        x = max(vroot_x, min(x, vroot_x + max(vroot_width - window_width, 0)))
+        y = max(vroot_y, min(y, vroot_y + max(vroot_height - window_height, 0)))
+        window.geometry(f"+{x}+{y}")
+    except tk.TclError:
+        return
+
+
 class ToolTip:
     def __init__(self, widget: tk.Widget, text: str) -> None:
         self.widget = widget
@@ -96,44 +136,56 @@ class ToolTip:
         self.widget.bind("<Enter>", self._schedule, add="+")
         self.widget.bind("<Leave>", self._hide, add="+")
         self.widget.bind("<ButtonPress>", self._hide, add="+")
+        self.widget.bind("<Destroy>", self._on_destroy, add="+")
 
     def _schedule(self, _event: tk.Event[tk.Widget]) -> None:
+        if not self.widget.winfo_exists():
+            return
         self.inside = True
         self._cancel_scheduled()
-        self.after_id = self.widget.after(350, self._show)
+        try:
+            self.after_id = self.widget.after(350, self._show)
+        except tk.TclError:
+            self.after_id = None
 
     def _show(self) -> None:
         self.after_id = None
-        if self.tip_window or not self.widget.winfo_exists():
-            return
-        if not self.text:
-            return
-        if not self.inside:
-            return
-        x = self.widget.winfo_rootx() + 18
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
-        self.tip_window = tk.Toplevel(self.widget)
-        self.tip_window.wm_overrideredirect(True)
-        self.tip_window.wm_geometry(f"+{x}+{y}")
-        label = tk.Label(
-            self.tip_window,
-            text=self.text,
-            justify="left",
-            background="#fff6cf",
-            foreground="#1d1d1d",
-            relief="solid",
-            borderwidth=1,
-            padx=8,
-            pady=5,
-            wraplength=280,
-        )
-        label.pack()
+        try:
+            if self.tip_window or not self.widget.winfo_exists():
+                return
+            if not self.text:
+                return
+            if not self.inside:
+                return
+            x = self.widget.winfo_rootx() + 18
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            self.tip_window = tk.Toplevel(self.widget)
+            self.tip_window.wm_overrideredirect(True)
+            self.tip_window.wm_geometry(f"+{x}+{y}")
+            label = tk.Label(
+                self.tip_window,
+                text=self.text,
+                justify="left",
+                background="#fff6cf",
+                foreground="#1d1d1d",
+                relief="solid",
+                borderwidth=1,
+                padx=8,
+                pady=5,
+                wraplength=280,
+            )
+            label.pack()
+        except tk.TclError:
+            self.tip_window = None
 
     def _hide(self, _event: tk.Event[tk.Widget] | None = None) -> None:
         self.inside = False
         self._cancel_scheduled()
         if self.tip_window is not None:
-            self.tip_window.destroy()
+            try:
+                self.tip_window.destroy()
+            except tk.TclError:
+                pass
             self.tip_window = None
 
     def _cancel_scheduled(self) -> None:
@@ -143,6 +195,9 @@ class ToolTip:
             except tk.TclError:
                 pass
             self.after_id = None
+
+    def _on_destroy(self, _event: tk.Event[tk.Widget] | None = None) -> None:
+        self._hide()
 
 
 class CollapsibleSection(ttk.Frame):
@@ -208,13 +263,18 @@ class PaintEditor:
         self.pixels = [[CUSTOM_ELEMENT_KEY for _ in range(self.grid_size)] for _ in range(self.grid_size)]
         self.rectangles: list[list[int]] = []
         self.drag_start: tuple[int, int] | None = None
+        self.undo_stack: list[list[list[str]]] = []
+        self.redo_stack: list[list[list[str]]] = []
+        self._history_snapshot: list[list[str]] | None = None
 
         self.window = tk.Toplevel(parent)
         self.window.title("Mini Paint")
         self.window.resizable(False, False)
+        self.window.transient(parent.winfo_toplevel())
 
         self._build()
         self._load_existing()
+        _position_toplevel_near_parent(self.window, parent)
 
     def _build(self) -> None:
         root = ttk.Frame(self.window, padding=12)
@@ -229,6 +289,10 @@ class PaintEditor:
         ttk.Radiobutton(toolbar, text="Circle", variable=self.tool, value="circle").pack(side="left", padx=(8, 0))
         ttk.Radiobutton(toolbar, text="Fill", variable=self.tool, value="fill").pack(side="left", padx=(8, 0))
         ttk.Button(toolbar, text="Pick Color", command=self._pick_color).pack(side="left", padx=(12, 0))
+        self.undo_button = ttk.Button(toolbar, text="Undo", command=self._undo)
+        self.undo_button.pack(side="left", padx=(8, 0))
+        self.redo_button = ttk.Button(toolbar, text="Redo", command=self._redo)
+        self.redo_button.pack(side="left", padx=(8, 0))
         ttk.Button(toolbar, text="Clear", command=self._clear).pack(side="left", padx=(8, 0))
         ttk.Button(toolbar, text="Save", command=self._save).pack(side="right")
 
@@ -259,6 +323,10 @@ class PaintEditor:
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.window.bind("<Control-z>", self._undo)
+        self.window.bind("<Control-y>", self._redo)
+        self.window.bind("<Control-Z>", self._undo)
+        self.window.bind("<Control-Y>", self._redo)
 
         for y in range(self.grid_size):
             row: list[int] = []
@@ -273,6 +341,7 @@ class PaintEditor:
                 )
                 row.append(rect)
             self.rectangles.append(row)
+        self._sync_history_buttons()
 
     def _pick_color(self) -> None:
         choice = colorchooser.askcolor(color=self.current_color.get(), parent=self.window)
@@ -289,17 +358,44 @@ class PaintEditor:
     def _active_color(self) -> str:
         return CUSTOM_ELEMENT_KEY if self.tool.get() == "eraser" else self.current_color.get()
 
+    def _snapshot_pixels(self) -> list[list[str]]:
+        return [row.copy() for row in self.pixels]
+
+    def _begin_history_action(self) -> None:
+        self._history_snapshot = self._snapshot_pixels()
+
+    def _commit_history_action(self) -> None:
+        if self._history_snapshot is None:
+            return
+        if self._history_snapshot != self.pixels:
+            self.undo_stack.append(self._history_snapshot)
+            self.redo_stack.clear()
+            self._sync_history_buttons()
+        self._history_snapshot = None
+
+    def _restore_pixels(self, snapshot: list[list[str]]) -> None:
+        for y, row in enumerate(snapshot):
+            for x, color in enumerate(row):
+                self._set_pixel(x, y, color)
+
+    def _sync_history_buttons(self) -> None:
+        self.undo_button.configure(state="normal" if self.undo_stack else "disabled")
+        self.redo_button.configure(state="normal" if self.redo_stack else "disabled")
+
     def _on_press(self, event: tk.Event[tk.Widget]) -> None:
         point = self._canvas_to_grid(event)
         if point is None:
             return
         tool = self.tool.get()
         if tool in {"pencil", "eraser"}:
+            self._begin_history_action()
             self._set_pixel(point[0], point[1], self._active_color())
             self.drag_start = point
             return
         if tool == "fill":
+            self._begin_history_action()
             self._flood_fill(point[0], point[1], self._active_color())
+            self._commit_history_action()
             self.drag_start = None
             return
         self.drag_start = point
@@ -313,18 +409,28 @@ class PaintEditor:
             self._set_pixel(point[0], point[1], self._active_color())
 
     def _on_release(self, event: tk.Event[tk.Widget]) -> None:
+        tool = self.tool.get()
+        if tool in {"pencil", "eraser"} and self.drag_start is not None:
+            self._commit_history_action()
+            self.drag_start = None
+            return
         point = self._canvas_to_grid(event)
         if point is None or self.drag_start is None:
             self.drag_start = None
             return
-        tool = self.tool.get()
         if tool == "line":
+            self._begin_history_action()
             self._draw_line(self.drag_start, point, self.current_color.get())
+            self._commit_history_action()
         elif tool == "circle":
+            self._begin_history_action()
             self._draw_circle(self.drag_start, point, self.current_color.get())
+            self._commit_history_action()
         self.drag_start = None
 
     def _set_pixel(self, x: int, y: int, color: str) -> None:
+        if self.pixels[y][x] == color:
+            return
         self.pixels[y][x] = color
         self.canvas.itemconfigure(self.rectangles[y][x], fill=color)
 
@@ -380,9 +486,27 @@ class PaintEditor:
             stack.append((px, py - 1))
 
     def _clear(self) -> None:
+        self._begin_history_action()
         for y in range(self.grid_size):
             for x in range(self.grid_size):
                 self._set_pixel(x, y, CUSTOM_ELEMENT_KEY)
+        self._commit_history_action()
+
+    def _undo(self, _event: tk.Event[tk.Widget] | None = None) -> None:
+        if not self.undo_stack:
+            return
+        self.redo_stack.append(self._snapshot_pixels())
+        snapshot = self.undo_stack.pop()
+        self._restore_pixels(snapshot)
+        self._sync_history_buttons()
+
+    def _redo(self, _event: tk.Event[tk.Widget] | None = None) -> None:
+        if not self.redo_stack:
+            return
+        self.undo_stack.append(self._snapshot_pixels())
+        snapshot = self.redo_stack.pop()
+        self._restore_pixels(snapshot)
+        self._sync_history_buttons()
 
     def _save(self) -> None:
         self.asset_path.parent.mkdir(parents=True, exist_ok=True)
@@ -450,14 +574,14 @@ class ControlPanel:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Cymatesserae Control Panel")
-        self.root.geometry("860x720")
-        self.root.minsize(760, 660)
+        self.root.geometry("860x560")
         self.project_root = Path(__file__).resolve().parents[1]
 
         self.audio_path = tk.StringVar()
         self.output_path = tk.StringVar(value="cymatesserae_output.mp4")
         self.width = tk.IntVar(value=1280)
         self.height = tk.IntVar(value=720)
+        self.link_dimensions = tk.BooleanVar(value=False)
         self.fps = tk.IntVar(value=30)
         self.points = tk.IntVar(value=180)
         self.duration = tk.StringVar()
@@ -481,46 +605,65 @@ class ControlPanel:
         self.cell_alternation = tk.StringVar(value="none")
         self.reorg_mode = tk.StringVar(value="burst")
         self.beats_per_switch = tk.IntVar(value=4)
+        self.stack_interaction = tk.StringVar(value="none")
         self.chroma_key_color = tk.StringVar()
         self.custom_element_path = tk.StringVar(value=str(self.project_root / "custom_elements" / "custom_element.bmp"))
         self.custom_element_paths: list[Path] = []
         self.graphic_vars = {name: tk.BooleanVar(value=False) for name in GRAPHIC_OPTIONS}
-        self.graphic_sections: dict[str, CollapsibleSection] = {}
+        self._next_channel_id = 1
+        self.channels: list[dict[str, object]] = [self._create_layer_state("", "Channel 1", custom_index=1)]
         self.status = tk.StringVar(value="Ready.")
         self.running_process: subprocess.Popen[str] | None = None
         self.log_handle = None
         self.log_path: Path | None = None
+        self.active_run_mode = "idle"
+        self.stop_requested = False
+        self.channels_popup: tk.Toplevel | None = None
+        self.channels_popup_frame: ttk.Frame | None = None
+        self._dimension_link_ratio = self.width.get() / max(self.height.get(), 1)
+        self._dimension_link_guard = False
+        self.dimension_link_button: tk.Canvas | None = None
 
         self._build()
+        self._bind_dimension_linking()
+        self._size_main_window_to_content()
+
+    def _size_window_to_content(
+        self,
+        window: tk.Toplevel,
+        parent: tk.Widget | None = None,
+        *,
+        min_width: int = 520,
+        min_height: int = 320,
+        max_width: int = 980,
+        max_height: int = 820,
+    ) -> None:
+        window.update_idletasks()
+        width = min(max(window.winfo_reqwidth(), min_width), max_width)
+        height = min(max(window.winfo_reqheight(), min_height), max_height)
+        window.geometry(f"{width}x{height}")
+        window.minsize(min(width, max_width), min(height, max_height))
+        if parent is not None:
+            _position_toplevel_near_parent(window, parent)
+
+    def _size_main_window_to_content(self) -> None:
+        self.root.update_idletasks()
+        width = min(max(self.root.winfo_reqwidth(), 760), 980)
+        height = min(max(self.root.winfo_reqheight(), 420), 760)
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(760, 420)
+
+    def _ttk_background(self, style_name: str = "TFrame") -> str:
+        style = ttk.Style(self.root)
+        return style.lookup(style_name, "background") or self.root.cget("bg")
 
     def _build(self) -> None:
-        outer = ttk.Frame(self.root)
-        outer.pack(fill="both", expand=True)
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(0, weight=1)
-
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-
-        container = ttk.Frame(canvas, padding=16)
+        container = ttk.Frame(self.root, padding=16)
+        container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
-        window_id = canvas.create_window((0, 0), window=container, anchor="nw")
-
-        def _update_scroll_region(_event: tk.Event[tk.Widget]) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _resize_inner_frame(_event: tk.Event[tk.Widget]) -> None:
-            canvas.itemconfigure(window_id, width=_event.width)
-
-        container.bind("<Configure>", _update_scroll_region)
-        canvas.bind("<Configure>", _resize_inner_frame)
 
         self._build_file_section(container)
         self._build_render_section(container)
-        self._build_style_section(container)
         self._build_graphics_section(container)
         self._build_actions(container)
 
@@ -556,18 +699,430 @@ class ControlPanel:
         for idx in range(6):
             frame.columnconfigure(idx, weight=1)
 
-        self._spinbox(frame, "Width", self.width, 0, 1, 320, 3840, tooltip="Final video width in pixels.")
-        self._spinbox(frame, "Height", self.height, 0, 3, 180, 2160, tooltip="Final video height in pixels.")
+        size_frame = ttk.LabelFrame(frame, text="Dimensions", padding=10)
+        size_frame.grid(row=0, column=0, columnspan=5, sticky="ew", pady=(0, 4))
+        size_frame.columnconfigure(0, weight=0)
+        size_frame.columnconfigure(1, weight=1)
+        size_frame.columnconfigure(2, weight=0)
+        size_frame.columnconfigure(3, weight=0)
+        size_frame.columnconfigure(4, weight=1)
+
+        width_label = ttk.Label(size_frame, text="Width")
+        width_label.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        width_spinbox = ttk.Spinbox(size_frame, textvariable=self.width, from_=320, to=3840, increment=1)
+        width_spinbox.grid(row=0, column=1, sticky="ew", pady=4)
+
+        self.dimension_link_button = tk.Canvas(
+            size_frame,
+            width=26,
+            height=26,
+            highlightthickness=0,
+            bd=0,
+            bg=self._ttk_background("TLabelframe"),
+            cursor="hand2",
+            relief="flat",
+        )
+        self.dimension_link_button.grid(row=0, column=2, pady=4, padx=14)
+        self.dimension_link_button.bind("<Button-1>", lambda _event: self._toggle_dimension_link())
+
+        height_label = ttk.Label(size_frame, text="Height")
+        height_label.grid(row=0, column=3, sticky="w", padx=(0, 8), pady=4)
+        height_spinbox = ttk.Spinbox(size_frame, textvariable=self.height, from_=180, to=2160, increment=1)
+        height_spinbox.grid(row=0, column=4, sticky="ew", pady=4)
+
         self._spinbox(frame, "FPS", self.fps, 1, 1, 12, 120, tooltip="Frames per second. Higher values look smoother but render slower.")
         self._spinbox(frame, "Points", self.points, 1, 3, 20, 600, tooltip="Base point count for the motion field. More points means denser visuals.")
         self._entry(frame, "Duration", self.duration, 2, 1, tooltip="Optional limit in seconds for quick tests. Leave blank to use the full audio.")
         self._spinbox(frame, "Seed", self.seed, 2, 3, 0, 999999, tooltip="Random seed for repeatable results.")
         self._spinbox(frame, "Plate M", self.plate_m, 3, 1, 1, 16, tooltip="Horizontal cymatic plate mode. Higher values create tighter nodal spacing.")
         self._spinbox(frame, "Plate N", self.plate_n, 3, 3, 1, 16, tooltip="Vertical cymatic plate mode. Pair it with Plate M to change the nodal grid.")
+        self._combo(frame, "Stack Interaction", self.stack_interaction, STACK_INTERACTION_OPTIONS, 4, 1, tooltip="How enabled channels interact while layered together. Pulse, duck, and spotlight respond to the audio automatically.")
         self._entry(frame, "Chroma Key", self.chroma_key_color, 4, 3, tooltip="Optional solid key color such as 00ff00 or ff00ff. The exact color will be reserved for the background.")
         cymatic_button = ttk.Checkbutton(frame, text="Cymatic mode", variable=self.cymatic)
-        cymatic_button.grid(row=4, column=1, sticky="w", pady=(8, 0))
+        cymatic_button.grid(row=4, column=4, columnspan=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self._tooltip(width_label, "Final video width in pixels.")
+        self._tooltip(width_spinbox, "Final video width in pixels.")
+        self._tooltip(height_label, "Final video height in pixels.")
+        self._tooltip(height_spinbox, "Final video height in pixels.")
+        self._tooltip(self.dimension_link_button, "Click to link or unlink width and height scaling.")
         self._tooltip(cymatic_button, "Pull motion toward vibrating-plate nodal lines for more cymatic behavior.")
+        self._refresh_dimension_link_button()
+
+    def _bind_dimension_linking(self) -> None:
+        self.width.trace_add("write", lambda *_: self._handle_dimension_change("width"))
+        self.height.trace_add("write", lambda *_: self._handle_dimension_change("height"))
+
+    def _refresh_dimension_link_ratio(self) -> None:
+        self._dimension_link_ratio = self.width.get() / max(self.height.get(), 1)
+        self._refresh_dimension_link_button()
+
+    def _toggle_dimension_link(self) -> None:
+        self.link_dimensions.set(not self.link_dimensions.get())
+        self._refresh_dimension_link_ratio()
+
+    def _refresh_dimension_link_button(self) -> None:
+        if self.dimension_link_button is None:
+            return
+        canvas = self.dimension_link_button
+        canvas.delete("all")
+        canvas.create_text(13, 13, text="🔗", fill="#1f1f1f", font=("Segoe UI Emoji", 12))
+        if self.link_dimensions.get():
+            return
+        canvas.create_line(6, 6, 20, 20, fill="#b22222", width=2)
+        canvas.create_line(20, 6, 6, 20, fill="#b22222", width=2)
+
+    def _handle_dimension_change(self, changed: str) -> None:
+        if self._dimension_link_guard:
+            return
+        if not self.link_dimensions.get():
+            self._refresh_dimension_link_ratio()
+            return
+
+        self._dimension_link_guard = True
+        try:
+            ratio = self._dimension_link_ratio if self._dimension_link_ratio > 0 else (self.width.get() / max(self.height.get(), 1))
+            if changed == "width":
+                new_height = max(2, int(round(self.width.get() / max(ratio, 1e-6))))
+                self.height.set(new_height)
+            else:
+                new_width = max(2, int(round(self.height.get() * ratio)))
+                self.width.set(new_width)
+        finally:
+            self._dimension_link_guard = False
+
+    def _default_custom_element_path(self, custom_index: int | None = None) -> Path:
+        candidates = []
+        if custom_index is not None:
+            candidates.append(self.project_root / "custom_elements" / f"custom_element{custom_index}.bmp")
+            candidates.append(self.project_root / "custom_elements" / f"custom_element_{custom_index}.bmp")
+        candidates.append(self.project_root / "custom_elements" / "custom_element.bmp")
+        for path in candidates:
+            if path.exists():
+                return path
+        return candidates[0]
+
+    def _create_layer_state(self, family: str, title: str, custom_index: int | None = None) -> dict[str, object]:
+        default_path = self._default_custom_element_path(custom_index)
+        cycle_defaults = {name: tk.BooleanVar(value=(name == family)) for name in GRAPHIC_OPTIONS}
+        channel_id = self._next_channel_id
+        self._next_channel_id += 1
+        layer = {
+            "channel_id": channel_id,
+            "family": family,
+            "title": tk.StringVar(value=title),
+            "summary": tk.StringVar(),
+            "enabled": tk.BooleanVar(value=False),
+            "opacity": tk.DoubleVar(value=1.0),
+            "transparent_color_path": tk.StringVar(),
+            "transparent_colors": [],
+            "graphic_cycle_vars": cycle_defaults,
+            "beats_per_switch": tk.IntVar(value=4),
+            "response_gain": tk.DoubleVar(value=1.0),
+            "style_a": tk.StringVar(value="ceramic"),
+            "style_b": tk.StringVar(value="neon"),
+            "morph_rate": tk.DoubleVar(value=0.18),
+            "layer_count": tk.IntVar(value=3),
+            "overlap": tk.DoubleVar(value=0.35),
+            "reorg_mode": tk.StringVar(value="burst"),
+            "pattern_layout": tk.StringVar(value="flow"),
+            "grid_strength": tk.DoubleVar(value=0.82),
+            "geometry_rigidity": tk.DoubleVar(value=0.75),
+            "layer_rigidity": tk.DoubleVar(value=0.55),
+            "tile_overlap": tk.DoubleVar(value=0.25),
+            "grid_columns": tk.IntVar(value=12),
+            "grid_rows": tk.IntVar(value=6),
+            "grid_pattern": tk.StringVar(value="rect"),
+            "cell_alternation": tk.StringVar(value="none"),
+            "custom_element_path": tk.StringVar(value=str(default_path)),
+            "custom_element_paths": [],
+            "transparent_colors_listbox": None,
+            "listbox": None,
+            "section": None,
+        }
+        for var in cycle_defaults.values():
+            var.trace_add("write", lambda *_args, current=layer: self._refresh_layer_summary(current))
+        self._refresh_layer_summary(layer)
+        return layer
+
+    def _selected_graphic_cycle(self, layer: dict[str, object]) -> tuple[str, ...]:
+        cycle_vars: dict[str, tk.BooleanVar] = layer["graphic_cycle_vars"]  # type: ignore[assignment]
+        cycle = tuple(name for name in GRAPHIC_OPTIONS if cycle_vars[name].get())
+        if not cycle:
+            return ()
+        return cycle
+
+    def _summarize_layer_graphics(self, layer: dict[str, object]) -> str:
+        selected = self._selected_graphic_cycle(layer)
+        if not selected:
+            return "no elements selected"
+        cycle_label = " -> ".join(selected)
+        if len(selected) > 1:
+            return f"cycle | {cycle_label}"
+        return cycle_label
+
+    def _refresh_layer_summary(self, layer: dict[str, object]) -> None:
+        summary_var = layer.get("summary")
+        if isinstance(summary_var, tk.StringVar):
+            summary_var.set(self._summarize_layer_graphics(layer))
+
+    def _render_layer_row(self, parent: ttk.Frame, layer: dict[str, object], removable: bool = True) -> None:
+        row = ttk.Frame(parent, padding=(0, 0, 0, 8))
+        row.pack(fill="x")
+        row.columnconfigure(1, weight=1)
+
+        enabled = ttk.Checkbutton(row, text="", variable=layer["enabled"])
+        enabled.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        title_label = ttk.Label(row, textvariable=layer["title"])
+        title_label.grid(row=0, column=1, sticky="w")
+
+        family_label = ttk.Label(row, textvariable=layer["summary"], foreground="#4f4f4f")
+        family_label.grid(row=1, column=1, sticky="w", pady=(2, 0))
+
+        ttk.Button(row, text="Edit Settings", command=lambda current=layer: self._open_layer_editor(current)).grid(row=0, column=2, rowspan=2, sticky="e")
+        if removable:
+            ttk.Button(
+                row,
+                text="Remove",
+                command=lambda current=layer, row_widget=row: self._remove_channel_row(current, row_widget),
+            ).grid(row=0, column=3, rowspan=2, sticky="e", padx=(8, 0))
+
+    def _open_layer_editor(self, layer: dict[str, object]) -> None:
+        window = tk.Toplevel(self.root)
+        window.title(f"{layer['title'].get()} Channel")
+        window.transient(self.root)
+        window.bind("<Destroy>", lambda _event: self._refresh_channels_popup(), add="+")
+
+        outer = ttk.Frame(window, padding=8)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0, bd=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        container = ttk.Frame(canvas, padding=16)
+        container.columnconfigure(0, weight=1)
+        window_id = canvas.create_window((0, 0), window=container, anchor="nw")
+
+        def sync_scroll_region(_event: tk.Event[tk.Widget] | None = None) -> None:
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except tk.TclError:
+                return
+
+        def sync_canvas_width(_event: tk.Event[tk.Widget]) -> None:
+            try:
+                canvas.itemconfigure(window_id, width=_event.width)
+            except tk.TclError:
+                return
+
+        def on_mousewheel(event: tk.Event[tk.Widget]) -> None:
+            delta = getattr(event, "delta", 0)
+            if delta == 0:
+                return
+            canvas.yview_scroll(int(-delta / 120), "units")
+
+        container.bind("<Configure>", sync_scroll_region, add="+")
+        canvas.bind("<Configure>", sync_canvas_width, add="+")
+        canvas.bind("<MouseWheel>", on_mousewheel, add="+")
+        container.bind("<MouseWheel>", on_mousewheel, add="+")
+
+        header = ttk.LabelFrame(container, text="Channel", padding=12)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(1, weight=1)
+        ttk.Checkbutton(header, text="Enable this channel", variable=layer["enabled"]).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="Name").grid(row=0, column=1, sticky="w", padx=(12, 8))
+        ttk.Entry(header, textvariable=layer["title"]).grid(row=0, column=2, sticky="ew")
+        header.columnconfigure(2, weight=1)
+        helper = ttk.Label(
+            header,
+            text="This channel renders alongside any other enabled channels. Start by naming it, then choose the element(s) it contains below.",
+            wraplength=560,
+            justify="left",
+        )
+        helper.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        row_idx = 1
+        graphics_frame = ttk.LabelFrame(container, text="Elements", padding=12)
+        graphics_frame.grid(row=row_idx, column=0, sticky="ew", pady=(0, 10))
+        for idx in range(4):
+            graphics_frame.columnconfigure(idx, weight=1)
+        graphics_helper = ttk.Label(
+            graphics_frame,
+            text="Choose the element(s) this channel contains. If you select more than one, this channel will cycle through them automatically.",
+            wraplength=560,
+            justify="left",
+        )
+        graphics_helper.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+        cycle_vars: dict[str, tk.BooleanVar] = layer["graphic_cycle_vars"]  # type: ignore[assignment]
+        preset_families = tuple(family for family in GRAPHIC_FAMILIES if family["name"] != "custom")
+        presets_expanded = any(cycle_vars[family["name"]].get() for family in preset_families)
+        presets_section = CollapsibleSection(
+            graphics_frame,
+            "Preset Elements",
+            "Built-in circles, lines, scribbles, geometrics, and Voronoi elements.",
+            expanded=presets_expanded,
+        )
+        presets_section.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        for idx in range(4):
+            presets_section.body.columnconfigure(idx, weight=1)
+        rotation_helper = ttk.Label(
+            presets_section.body,
+            text="Choose additional elements here. When more than one element is selected, this channel rotates through them on the beat.",
+            wraplength=560,
+            justify="left",
+        )
+        rotation_helper.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        for idx, family in enumerate(preset_families):
+            ttk.Checkbutton(
+                presets_section.body,
+                text=family["title"],
+                variable=cycle_vars[family["name"]],
+            ).grid(row=1 + idx // 2, column=idx % 2, sticky="w", padx=(0, 12), pady=2)
+        self._spinbox(
+            presets_section.body,
+            "Beats Per Switch",
+            layer["beats_per_switch"],
+            4,
+            1,
+            1,
+            32,
+            tooltip="How many beats this channel keeps one graphic before switching to the next selected graphic.",
+        )
+        self._spinbox(
+            presets_section.body,
+            "Response Gain",
+            layer["response_gain"],
+            4,
+            3,
+            0.1,
+            4.0,
+            increment=0.1,
+            tooltip="How strongly this channel reacts to audio pulses and onset triggers.",
+        )
+        row_idx += 1
+
+        # Custom elements section - only visible if family is "custom"
+        custom_frame = ttk.LabelFrame(container, text="Custom Elements", padding=12)
+        custom_frame.grid(row=row_idx, column=0, sticky="ew", pady=(0, 10))
+        custom_frame.columnconfigure(0, weight=1)
+        ttk.Checkbutton(
+            custom_frame,
+            text="Include custom elements in this channel",
+            variable=cycle_vars["custom"],
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        custom_content = ttk.Frame(custom_frame)
+        custom_content.grid(row=1, column=0, sticky="ew")
+        custom_content.columnconfigure(1, weight=1)
+        ttk.Label(custom_content, text="New element").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(custom_content, textvariable=layer["custom_element_path"]).grid(row=0, column=1, sticky="ew")
+        ttk.Button(custom_content, text="Add File", command=lambda current=layer: self._choose_custom_elements_for_layer(current)).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(custom_content, text="Open Paint Editor", command=lambda current=layer: self._open_paint_editor_for_layer(current)).grid(row=1, column=1, sticky="w", pady=(8, 0))
+
+        list_frame = ttk.Frame(custom_content)
+        list_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        list_frame.columnconfigure(0, weight=1)
+        ttk.Label(list_frame, text="Custom sprite list").grid(row=0, column=0, sticky="w")
+        listbox = tk.Listbox(list_frame, height=5)
+        listbox.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        layer["listbox"] = listbox
+        buttons = ttk.Frame(list_frame)
+        buttons.grid(row=1, column=1, sticky="ns", padx=(8, 0))
+        ttk.Button(buttons, text="Add Draft", command=lambda current=layer: self._add_current_custom_path_for_layer(current)).pack(fill="x")
+        ttk.Button(buttons, text="Remove", command=lambda current=layer: self._remove_selected_custom_element_for_layer(current)).pack(fill="x", pady=(6, 0))
+        ttk.Button(buttons, text="Clear", command=lambda current=layer: self._clear_custom_elements_for_layer(current)).pack(fill="x", pady=(6, 0))
+        self._refresh_custom_layer_listbox(layer)
+        
+        # Hide/show custom frame based on family selection
+        def sync_custom_visibility() -> None:
+            if "custom" in self._selected_graphic_cycle(layer):
+                custom_content.grid()
+                return
+            custom_content.grid_remove()
+        
+        for var in cycle_vars.values():
+            var.trace_add("write", lambda *_: (sync_custom_visibility(), self._refresh_channels_popup()))
+        layer["title"].trace_add("write", lambda *_: self._refresh_channels_popup())
+        sync_custom_visibility()
+        row_idx += 1
+
+        style_frame = ttk.LabelFrame(container, text="Style / Motion", padding=12)
+        style_frame.grid(row=row_idx, column=0, sticky="ew", pady=(0, 10))
+        for idx in range(6):
+            style_frame.columnconfigure(idx, weight=1)
+        style_helper = ttk.Label(
+            style_frame,
+            text="These settings affect this channel only. Overlap passes are internal copies drawn within this one channel.",
+            wraplength=560,
+            justify="left",
+        )
+        style_helper.grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 8))
+        self._combo(style_frame, "Style A", layer["style_a"], STYLE_OPTIONS, 1, 1)
+        self._combo(style_frame, "Style B", layer["style_b"], STYLE_OPTIONS, 1, 3)
+        self._spinbox(style_frame, "Morph Rate", layer["morph_rate"], 2, 1, 0.0, 2.0, increment=0.05)
+        self._spinbox(style_frame, "Overlap Passes", layer["layer_count"], 2, 3, 1, 8)
+        self._spinbox(style_frame, "Overlap", layer["overlap"], 3, 1, 0.0, 1.5, increment=0.05)
+        self._combo(style_frame, "Reorg", layer["reorg_mode"], REORG_OPTIONS, 3, 3)
+        self._spinbox(style_frame, "Opacity", layer["opacity"], 4, 1, 0.0, 1.0, increment=0.05)
+        
+        # Transparent colors section
+        transparent_colors_label = ttk.Label(style_frame, text="Transparent Colors")
+        transparent_colors_label.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        transparent_color_entry = ttk.Entry(style_frame, textvariable=layer["transparent_color_path"])
+        transparent_color_entry.grid(row=5, column=2, columnspan=2, sticky="ew", pady=(8, 4))
+        transparent_color_button = ttk.Button(
+            style_frame,
+            text="Pick",
+            command=lambda current=layer, parent=window: self._choose_transparent_color_for_layer(current, parent),
+        )
+        transparent_color_button.grid(row=5, column=4, sticky="w", padx=(8, 0), pady=(8, 4))
+        self._tooltip(transparent_colors_label, "Optional colors to key out inside this channel.")
+        self._tooltip(transparent_color_entry, "Hex color value to be added to the transparent list.")
+        self._tooltip(transparent_color_button, "Pick a color to add to the transparent colors list.")
+        
+        # Transparent colors listbox
+        tc_list_frame = ttk.Frame(style_frame)
+        tc_list_frame.grid(row=6, column=0, columnspan=6, sticky="ew", pady=(4, 0))
+        tc_list_frame.columnconfigure(0, weight=1)
+        ttk.Label(tc_list_frame, text="Colors to key out").grid(row=0, column=0, sticky="w")
+        tc_listbox = tk.Listbox(tc_list_frame, height=3)
+        tc_listbox.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        layer["transparent_colors_listbox"] = tc_listbox
+        tc_buttons = ttk.Frame(tc_list_frame)
+        tc_buttons.grid(row=1, column=1, sticky="ns", padx=(8, 0))
+        ttk.Button(tc_buttons, text="Add", command=lambda current=layer: self._add_transparent_color_for_layer(current)).pack(fill="x")
+        ttk.Button(tc_buttons, text="Remove", command=lambda current=layer: self._remove_transparent_color_for_layer(current)).pack(fill="x", pady=(6, 0))
+        ttk.Button(tc_buttons, text="Clear", command=lambda current=layer: self._clear_transparent_colors_for_layer(current)).pack(fill="x", pady=(6, 0))
+        self._refresh_transparent_colors_listbox(layer)
+        row_idx += 1
+
+        grid_frame = ttk.LabelFrame(container, text="Grid Layout", padding=12)
+        grid_frame.grid(row=row_idx, column=0, sticky="ew")
+        for idx in range(6):
+            grid_frame.columnconfigure(idx, weight=1)
+        grid_helper = ttk.Label(
+            grid_frame,
+            text="Grid controls also belong to this channel only.",
+            wraplength=560,
+            justify="left",
+        )
+        grid_helper.grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 8))
+        self._combo(grid_frame, "Pattern Layout", layer["pattern_layout"], PATTERN_LAYOUT_OPTIONS, 1, 1)
+        self._combo(grid_frame, "Grid Pattern", layer["grid_pattern"], GRID_PATTERN_OPTIONS, 1, 3)
+        self._combo(grid_frame, "Cell Alternation", layer["cell_alternation"], CELL_ALTERNATION_OPTIONS, 2, 1)
+        self._spinbox(grid_frame, "Grid Strength", layer["grid_strength"], 2, 3, 0.0, 1.0, increment=0.05)
+        self._spinbox(grid_frame, "Geometry Rigidity", layer["geometry_rigidity"], 3, 1, 0.0, 1.0, increment=0.05)
+        self._spinbox(grid_frame, "Layer Rigidity", layer["layer_rigidity"], 3, 3, 0.0, 1.0, increment=0.05)
+        self._spinbox(grid_frame, "Tile Overlap", layer["tile_overlap"], 4, 1, 0.0, 1.0, increment=0.05)
+        self._spinbox(grid_frame, "Grid Columns", layer["grid_columns"], 4, 3, 0, 200)
+        self._spinbox(grid_frame, "Grid Rows", layer["grid_rows"], 5, 1, 0, 200)
+        self._size_window_to_content(window, self.root, min_width=720, min_height=520, max_width=920, max_height=760)
+        sync_scroll_region()
 
     def _build_style_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Style and Motion", padding=12)
@@ -580,82 +1135,132 @@ class ControlPanel:
         self._spinbox(frame, "Morph Rate", self.morph_rate, 1, 1, 0.0, 2.0, increment=0.05, tooltip="How quickly the renderer drifts between the two styles.")
         self._spinbox(frame, "Layers", self.layers, 1, 3, 1, 8, tooltip="Number of overlapping passes drawn for each graphic family.")
         self._spinbox(frame, "Overlap", self.overlap, 2, 1, 0.0, 1.5, increment=0.05, tooltip="Controls layer spread, echo, and visual density.")
-        self._combo(frame, "Pattern Layout", self.pattern_layout, PATTERN_LAYOUT_OPTIONS, 2, 3, tooltip="Use flow for freer motion or grid for more stationary placements.")
-        self._spinbox(frame, "Grid Strength", self.grid_strength, 3, 1, 0.0, 1.0, increment=0.05, tooltip="How firmly grid layout holds patterns in place.")
-        self._spinbox(frame, "Geometry Rigidity", self.geometry_rigidity, 3, 3, 0.0, 1.0, increment=0.05, tooltip="How rigidly tile positions lock to the grid in grid mode.")
-        self._spinbox(frame, "Layer Rigidity", self.layer_rigidity, 4, 1, 0.0, 1.0, increment=0.05, tooltip="How much layer shear, offset, and pulse are suppressed in grid mode.")
-        self._spinbox(frame, "Tile Overlap", self.tile_overlap, 4, 3, 0.0, 1.0, increment=0.05, tooltip="How tightly stationary tiles and custom sprites overlap.")
-        self._spinbox(frame, "Grid Columns", self.grid_columns, 5, 1, 0, 200, tooltip="Explicit grid column count in grid mode. Use 0 to auto-fit.")
-        self._spinbox(frame, "Grid Rows", self.grid_rows, 5, 3, 0, 200, tooltip="Explicit grid row count in grid mode. Use 0 to auto-fit.")
-        self._combo(frame, "Grid Pattern", self.grid_pattern, GRID_PATTERN_OPTIONS, 6, 1, tooltip="Alternative cell arrangements for grid mode.")
-        self._combo(frame, "Cell Alternation", self.cell_alternation, CELL_ALTERNATION_OPTIONS, 6, 3, tooltip="Alternate inverse orientation and/or inverse color between neighboring grid cells.")
-        self._combo(frame, "Reorg", self.reorg_mode, REORG_OPTIONS, 7, 1, tooltip="How strong percussive hits reorganize the motion field.")
+        self._combo(frame, "Reorg", self.reorg_mode, REORG_OPTIONS, 2, 3, tooltip="How strong percussive hits reorganize the motion field.")
+
+    def _build_grid_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Grid Layout", padding=12)
+        frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        for idx in range(6):
+            frame.columnconfigure(idx, weight=1)
+
+        helper = ttk.Label(frame, text="These controls matter most when Pattern Layout is set to grid.")
+        helper.grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 6))
+        self._tooltip(helper, "Use this block to control rigid screen-filling tile layouts and alternating cell behavior.")
+
+        self._combo(frame, "Pattern Layout", self.pattern_layout, PATTERN_LAYOUT_OPTIONS, 1, 1, tooltip="Use flow for freer motion or grid for more stationary placements.")
+        self._combo(frame, "Grid Pattern", self.grid_pattern, GRID_PATTERN_OPTIONS, 1, 3, tooltip="Alternative cell arrangements for grid mode.")
+        self._combo(frame, "Cell Alternation", self.cell_alternation, CELL_ALTERNATION_OPTIONS, 2, 1, tooltip="Alternate inverse orientation and/or inverse color between neighboring grid cells.")
+        self._spinbox(frame, "Grid Strength", self.grid_strength, 2, 3, 0.0, 1.0, increment=0.05, tooltip="How firmly grid layout holds patterns in place.")
+        self._spinbox(frame, "Geometry Rigidity", self.geometry_rigidity, 3, 1, 0.0, 1.0, increment=0.05, tooltip="How rigidly tile positions lock to the grid in grid mode.")
+        self._spinbox(frame, "Layer Rigidity", self.layer_rigidity, 3, 3, 0.0, 1.0, increment=0.05, tooltip="How much layer shear, offset, and pulse are suppressed in grid mode.")
+        self._spinbox(frame, "Tile Overlap", self.tile_overlap, 4, 1, 0.0, 1.0, increment=0.05, tooltip="How tightly stationary tiles and custom sprites overlap.")
+        self._spinbox(frame, "Grid Columns", self.grid_columns, 4, 3, 0, 200, tooltip="Explicit grid column count in grid mode. Use 0 to auto-fit.")
+        self._spinbox(frame, "Grid Rows", self.grid_rows, 5, 1, 0, 200, tooltip="Explicit grid row count in grid mode. Use 0 to auto-fit.")
 
     def _build_graphics_section(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Beat-Driven Graphic Switching", padding=12)
-        frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        frame = ttk.LabelFrame(parent, text="Graphics", padding=12)
+        frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         frame.columnconfigure(0, weight=1)
 
-        graphic_label = ttk.Label(frame, text="Graphic families")
-        graphic_label.grid(row=0, column=0, sticky="w")
-        helper_label = ttk.Label(frame, text="Enable the families you want in the switch cycle.")
-        helper_label.grid(row=1, column=0, sticky="w", pady=(0, 6))
-        self._tooltip(graphic_label, "These are the large visual families the renderer can switch between globally.")
-        self._tooltip(helper_label, "The active family changes on the detected beat according to Beats Per Switch.")
+        helper = ttk.Label(frame, text="Create channels here, then choose the reusable element(s) each channel uses.")
+        helper.grid(row=0, column=0, sticky="w", pady=(0, 10))
 
-        actions = ttk.Frame(frame)
-        actions.grid(row=2, column=0, sticky="w", pady=(0, 10))
-        ttk.Button(actions, text="Expand all", command=self._expand_all_graphic_sections).pack(side="left")
-        ttk.Button(actions, text="Collapse all", command=self._collapse_all_graphic_sections).pack(side="left", padx=(8, 0))
+        popup_row = ttk.Frame(frame)
+        popup_row.grid(row=1, column=0, sticky="w", pady=(0, 10))
+        ttk.Button(popup_row, text="Open Channels", command=self._open_channels_popup).pack(side="left")
 
-        families = ttk.Frame(frame)
-        families.grid(row=3, column=0, sticky="ew")
-        families.columnconfigure(0, weight=1)
+        cycle_note = ttk.Label(
+            frame,
+            text="Workflow: create a channel, choose its reusable element(s), and if you select more than one the channel will cycle through them automatically.",
+            wraplength=520,
+            justify="left",
+        )
+        cycle_note.grid(row=2, column=0, sticky="w")
 
-        for row_idx, family in enumerate(GRAPHIC_FAMILIES):
-            section = CollapsibleSection(
-                families,
-                title=family["title"],
-                summary=family["summary"],
-                expanded=row_idx == 0,
-            )
-            section.grid(row=row_idx, column=0, sticky="ew", pady=(0, 8))
-            self.graphic_sections[family["name"]] = section
+    def _populate_channels_popup(self, parent: ttk.Frame) -> None:
+        for child in parent.winfo_children():
+            child.destroy()
+        for layer in self.channels:
+            self._render_layer_row(parent, layer, removable=True)
 
-            enabled = ttk.Checkbutton(section.body, text="Include in beat switch cycle", variable=self.graphic_vars[family["name"]])
-            enabled.grid(row=0, column=0, sticky="w")
-            details = ttk.Label(section.body, text=family["details"], wraplength=680, justify="left")
-            details.grid(row=1, column=0, sticky="w", pady=(6, 0))
-            self._tooltip(enabled, family["summary"])
+    def _open_channels_popup(self) -> None:
+        if self.channels_popup is not None:
+            try:
+                if self.channels_popup.winfo_exists():
+                    self.channels_popup.lift()
+                    self.channels_popup.focus_force()
+                    return
+            except tk.TclError:
+                pass
+            self.channels_popup = None
+            self.channels_popup_frame = None
 
-            if family["name"] == "custom":
-                asset_row = ttk.Frame(section.body)
-                asset_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-                asset_row.columnconfigure(1, weight=1)
-                ttk.Label(asset_row, text="New element").grid(row=0, column=0, sticky="w", padx=(0, 8))
-                asset_entry = ttk.Entry(asset_row, textvariable=self.custom_element_path)
-                asset_entry.grid(row=0, column=1, sticky="ew")
-                ttk.Button(asset_row, text="Add File", command=self._choose_custom_elements).grid(row=0, column=2, padx=(8, 0))
-                ttk.Button(asset_row, text="Open Paint Editor", command=self._open_paint_editor).grid(row=1, column=1, sticky="w", pady=(8, 0))
-                self._tooltip(asset_entry, "Type a sprite path here for the paint editor or add it to the list below.")
+        window = tk.Toplevel(self.root)
+        window.title("Channels")
+        window.transient(self.root)
+        self.channels_popup = window
+        window.bind("<Destroy>", lambda _event: self._on_channels_popup_destroyed(), add="+")
 
-                list_frame = ttk.Frame(section.body)
-                list_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-                list_frame.columnconfigure(0, weight=1)
-                ttk.Label(list_frame, text="Custom sprite list").grid(row=0, column=0, sticky="w")
-                self.custom_elements_listbox = tk.Listbox(list_frame, height=5)
-                self.custom_elements_listbox.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-                buttons = ttk.Frame(list_frame)
-                buttons.grid(row=1, column=1, sticky="ns", padx=(8, 0))
-                ttk.Button(buttons, text="Add Draft", command=self._add_current_custom_path).pack(fill="x")
-                ttk.Button(buttons, text="Remove", command=self._remove_selected_custom_element).pack(fill="x", pady=(6, 0))
-                ttk.Button(buttons, text="Clear", command=self._clear_custom_elements).pack(fill="x", pady=(6, 0))
+        container = ttk.Frame(window, padding=16)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
 
-        self._spinbox(frame, "Beats Per Switch", self.beats_per_switch, 4, 1, 1, 16, tooltip="How many detected beats each graphic family stays active before the next one takes over.")
+        actions = ttk.Frame(container)
+        actions.pack(anchor="w", pady=(0, 10))
+        layers_frame = ttk.Frame(container)
+        layers_frame.pack(fill="both", expand=True)
+        layers_frame.columnconfigure(0, weight=1)
+        self.channels_popup_frame = layers_frame
+
+        helper = ttk.Label(container, text="Channels work like mixer lanes. Each one can reuse built-in and custom elements, and enabled channels layer together with the selected stack interaction.")
+        helper.pack(anchor="w", pady=(0, 10))
+
+        ttk.Button(actions, text="Create Channel", command=lambda: self._add_channel_and_refresh(layers_frame)).pack(side="left")
+        self._populate_channels_popup(layers_frame)
+        self._size_window_to_content(window, self.root, min_width=660, min_height=360, max_width=900, max_height=780)
+
+    def _on_channels_popup_destroyed(self) -> None:
+        self.channels_popup = None
+        self.channels_popup_frame = None
+        self._clear_dead_channel_widgets()
+
+    def _clear_dead_channel_widgets(self) -> None:
+        for layer in self.channels:
+            listbox = layer.get("listbox")
+            if isinstance(listbox, tk.Listbox):
+                try:
+                    if not listbox.winfo_exists():
+                        layer["listbox"] = None
+                except tk.TclError:
+                    layer["listbox"] = None
+            transparent_colors_listbox = layer.get("transparent_colors_listbox")
+            if isinstance(transparent_colors_listbox, tk.Listbox):
+                try:
+                    if not transparent_colors_listbox.winfo_exists():
+                        layer["transparent_colors_listbox"] = None
+                except tk.TclError:
+                    layer["transparent_colors_listbox"] = None
+
+    def _add_channel_and_refresh(self, layers_frame: ttk.Frame) -> None:
+        self._add_channel()
+        self._populate_channels_popup(layers_frame)
+
+    def _refresh_channels_popup(self) -> None:
+        frame = self.channels_popup_frame
+        if frame is None:
+            return
+        try:
+            if not frame.winfo_exists():
+                self.channels_popup_frame = None
+                return
+        except tk.TclError:
+            self.channels_popup_frame = None
+            return
+        self._populate_channels_popup(frame)
 
     def _build_actions(self, parent: ttk.Frame) -> None:
         frame = ttk.Frame(parent, padding=(0, 8, 0, 0))
-        frame.grid(row=4, column=0, sticky="ew")
+        frame.grid(row=3, column=0, sticky="ew")
         frame.columnconfigure(0, weight=1)
 
         status_label = ttk.Label(frame, textvariable=self.status)
@@ -665,10 +1270,13 @@ class ControlPanel:
         preview_button = ttk.Button(actions, text="Preview", command=lambda: self._launch(preview=True))
         preview_button.pack(side="left", padx=(0, 8))
         export_button = ttk.Button(actions, text="Export MP4", command=lambda: self._launch(preview=False))
-        export_button.pack(side="left")
+        export_button.pack(side="left", padx=(0, 8))
+        stop_button = ttk.Button(actions, text="Stop Render", command=self._stop_render)
+        stop_button.pack(side="left")
         self._tooltip(status_label, "Shows whether the renderer is idle, running, or finished.")
-        self._tooltip(preview_button, "Open a live render window using the current settings.")
+        self._tooltip(preview_button, "Open a lighter live-only preview window that skips MP4 export work.")
         self._tooltip(export_button, "Render the current settings to an MP4 file.")
+        self._tooltip(stop_button, "Stop the active preview or export process.")
 
     def _entry(self, parent: ttk.Frame, label: str, variable: tk.Variable, row: int, col: int, tooltip: str = "") -> None:
         label_widget = ttk.Label(parent, text=label)
@@ -724,101 +1332,256 @@ class ControlPanel:
         if text:
             ToolTip(widget, text)
 
-    def _expand_all_graphic_sections(self) -> None:
-        for section in self.graphic_sections.values():
-            section.expand()
-
-    def _collapse_all_graphic_sections(self) -> None:
-        for section in self.graphic_sections.values():
-            section.collapse()
-
     def _choose_audio(self) -> None:
         path = filedialog.askopenfilename(
             title="Choose audio file",
+            parent=self.root,
             filetypes=[("Audio files", "*.wav *.mp3 *.flac *.ogg *.m4a"), ("All files", "*.*")],
         )
         if path:
             self.audio_path.set(path)
-            output_guess = Path(path).with_suffix(".mp4").name
-            if not self.output_path.get():
-                self.output_path.set(output_guess)
+            current_output = self.output_path.get().strip()
+            output_name = Path(path).with_suffix(".mp4").name
+            if current_output:
+                output_guess = Path(current_output).with_name(output_name)
+            else:
+                output_guess = Path(output_name)
+            self.output_path.set(str(output_guess))
 
     def _choose_output(self) -> None:
         path = filedialog.asksaveasfilename(
             title="Save MP4 as",
+            parent=self.root,
             defaultextension=".mp4",
             filetypes=[("MP4 video", "*.mp4")],
         )
         if path:
             self.output_path.set(path)
 
-    def _choose_custom_elements(self) -> None:
+    def _add_channel(self) -> None:
+        index = len(self.channels) + 1
+        self.channels.append(self._create_layer_state("", f"Channel {index}", custom_index=index))
+
+    def _remove_channel(self, layer: dict[str, object]) -> None:
+        channel_id = layer.get("channel_id")
+        self.channels = [current for current in self.channels if current.get("channel_id") != channel_id]
+        if not self.channels:
+            self.channels.append(self._create_layer_state("", "Channel 1", custom_index=1))
+
+    def _remove_channel_and_refresh(self, layer: dict[str, object]) -> None:
+        self._remove_channel(layer)
+        self._refresh_channels_popup()
+
+    def _remove_channel_row(self, layer: dict[str, object], row_widget: ttk.Frame) -> None:
+        previous_count = len(self.channels)
+        self._remove_channel(layer)
+        if len(self.channels) == previous_count:
+            return
+        try:
+            if row_widget.winfo_exists() and self.channels:
+                row_widget.destroy()
+        except tk.TclError:
+            pass
+        if len(self.channels) <= 1:
+            self._refresh_channels_popup()
+
+    def _refresh_custom_layer_listbox(self, layer: dict[str, object]) -> None:
+        listbox = layer.get("listbox")
+        if not isinstance(listbox, tk.Listbox):
+            return
+        try:
+            if not listbox.winfo_exists():
+                layer["listbox"] = None
+                return
+            listbox.delete(0, "end")
+            for path in layer["custom_element_paths"]:
+                listbox.insert("end", str(path))
+        except tk.TclError:
+            layer["listbox"] = None
+
+    def _append_custom_element_to_layer(self, layer: dict[str, object], path: Path) -> None:
+        resolved = path.resolve()
+        paths: list[Path] = layer["custom_element_paths"]  # type: ignore[assignment]
+        if resolved not in paths:
+            paths.append(resolved)
+        cycle_vars: dict[str, tk.BooleanVar] = layer["graphic_cycle_vars"]  # type: ignore[assignment]
+        cycle_vars["custom"].set(True)
+        self._refresh_custom_layer_listbox(layer)
+
+    def _choose_custom_elements_for_layer(self, layer: dict[str, object]) -> None:
         paths = filedialog.askopenfilenames(
             title="Choose custom elements",
+            parent=self.root,
             filetypes=[("Bitmap images", "*.bmp *.png"), ("All files", "*.*")],
         )
         if not paths:
             return
         for path in paths:
-            self._append_custom_element(Path(path))
-        self.custom_element_path.set(paths[-1])
+            self._append_custom_element_to_layer(layer, Path(path))
+        layer["custom_element_path"].set(paths[-1])
+        layer["enabled"].set(True)
 
-    def _open_paint_editor(self) -> None:
-        PaintEditor(self.root, Path(self.custom_element_path.get().strip()), on_save=self._handle_custom_element_saved)
+    def _open_paint_editor_for_layer(self, layer: dict[str, object]) -> None:
+        PaintEditor(
+            self.root,
+            Path(layer["custom_element_path"].get().strip()),
+            on_save=lambda path, current=layer: self._handle_custom_element_saved_for_layer(current, path),
+        )
 
-    def _handle_custom_element_saved(self, path: Path) -> None:
-        self.custom_element_path.set(str(path))
-        self._append_custom_element(path)
-        self.graphic_vars["custom"].set(True)
-        section = self.graphic_sections.get("custom")
-        if section is not None:
-            section.expand()
+    def _choose_transparent_color_for_layer(self, layer: dict[str, object], parent: tk.Widget) -> None:
+        initial = None
+        current = layer["transparent_color_path"].get().strip()
+        if current:
+            try:
+                initial = f"#{normalize_hex_color_text(current)}"
+            except ValueError:
+                initial = None
+        choice = colorchooser.askcolor(color=initial, parent=parent)
+        if choice[1]:
+            layer["transparent_color_path"].set(choice[1].lstrip("#").lower())
+            self._add_transparent_color_for_layer(layer)
 
-    def _append_custom_element(self, path: Path) -> None:
-        resolved = path.resolve()
-        if resolved not in self.custom_element_paths:
-            self.custom_element_paths.append(resolved)
-            self.custom_elements_listbox.insert("end", str(resolved))
+    def _refresh_transparent_colors_listbox(self, layer: dict[str, object]) -> None:
+        listbox = layer.get("transparent_colors_listbox")
+        if not isinstance(listbox, tk.Listbox):
+            return
+        try:
+            if not listbox.winfo_exists():
+                layer["transparent_colors_listbox"] = None
+                return
+            listbox.delete(0, "end")
+            for color in layer["transparent_colors"]:
+                listbox.insert("end", color)
+        except tk.TclError:
+            layer["transparent_colors_listbox"] = None
 
-    def _add_current_custom_path(self) -> None:
-        text = self.custom_element_path.get().strip()
+    def _add_transparent_color_for_layer(self, layer: dict[str, object]) -> None:
+        text = layer["transparent_color_path"].get().strip()
+        if not text:
+            messagebox.showerror("Missing color", "Enter a hex color (RRGGBB) first or use the Pick button.")
+            return
+        try:
+            normalized = normalize_hex_color_text(text)
+            colors: list[str] = layer["transparent_colors"]  # type: ignore[assignment]
+            if normalized not in colors:
+                colors.append(normalized)
+            self._refresh_transparent_colors_listbox(layer)
+            layer["transparent_color_path"].set("")
+        except ValueError as e:
+            messagebox.showerror("Invalid color", str(e))
+
+    def _remove_transparent_color_for_layer(self, layer: dict[str, object]) -> None:
+        listbox = layer.get("transparent_colors_listbox")
+        if not isinstance(listbox, tk.Listbox):
+            return
+        selection = listbox.curselection()
+        if not selection:
+            return
+        colors: list[str] = layer["transparent_colors"]  # type: ignore[assignment]
+        for index in reversed(selection):
+            del colors[index]
+        self._refresh_transparent_colors_listbox(layer)
+
+    def _clear_transparent_colors_for_layer(self, layer: dict[str, object]) -> None:
+        colors: list[str] = layer["transparent_colors"]  # type: ignore[assignment]
+        colors.clear()
+        self._refresh_transparent_colors_listbox(layer)
+
+    def _handle_custom_element_saved_for_layer(self, layer: dict[str, object], path: Path) -> None:
+        layer["custom_element_path"].set(str(path))
+        self._append_custom_element_to_layer(layer, path)
+        layer["enabled"].set(True)
+
+    def _add_current_custom_path_for_layer(self, layer: dict[str, object]) -> None:
+        text = layer["custom_element_path"].get().strip()
         if not text:
             messagebox.showerror("Missing path", "Enter a custom element path first.")
             return
-        self._append_custom_element(Path(text))
-        self.graphic_vars["custom"].set(True)
+        path = Path(text)
+        if not path.exists():
+            messagebox.showerror("Missing draft", f"Custom element not found:\n{path}\n\nSave it from the paint editor or choose an existing file first.")
+            return
+        self._append_custom_element_to_layer(layer, path)
+        layer["enabled"].set(True)
 
-    def _remove_selected_custom_element(self) -> None:
-        selection = self.custom_elements_listbox.curselection()
+    def _remove_selected_custom_element_for_layer(self, layer: dict[str, object]) -> None:
+        listbox = layer.get("listbox")
+        if not isinstance(listbox, tk.Listbox):
+            return
+        selection = listbox.curselection()
         if not selection:
             return
+        paths: list[Path] = layer["custom_element_paths"]  # type: ignore[assignment]
         for index in reversed(selection):
-            self.custom_elements_listbox.delete(index)
-            del self.custom_element_paths[index]
+            del paths[index]
+        self._refresh_custom_layer_listbox(layer)
 
-    def _clear_custom_elements(self) -> None:
-        self.custom_elements_listbox.delete(0, "end")
-        self.custom_element_paths.clear()
+    def _clear_custom_elements_for_layer(self, layer: dict[str, object]) -> None:
+        paths: list[Path] = layer["custom_element_paths"]  # type: ignore[assignment]
+        paths.clear()
+        self._refresh_custom_layer_listbox(layer)
 
-    def _selected_graphics(self) -> list[str]:
-        return [name for name, var in self.graphic_vars.items() if var.get()]
+    def _active_layer_payloads(self) -> list[dict[str, object]]:
+        layers = list(self.channels)
+        payloads: list[dict[str, object]] = []
+        for layer in layers:
+            if not layer["enabled"].get():
+                continue
+            graphic_cycle = self._selected_graphic_cycle(layer)
+            if not graphic_cycle:
+                raise ValueError(f"{layer['title'].get()} needs at least one selected element.")
+            stored_paths: list[Path] = layer["custom_element_paths"]  # type: ignore[assignment]
+            custom_paths = tuple(path for path in stored_paths if path.exists())
+            needs_custom = "custom" in graphic_cycle
+            if needs_custom and not custom_paths:
+                current = layer["custom_element_path"].get().strip()
+                if current:
+                    current_path = Path(current).resolve()
+                    if current_path.exists():
+                        custom_paths = (current_path,)
+            if needs_custom and not custom_paths:
+                raise ValueError(f"{layer['title'].get()} needs at least one custom element.")
+            transparent_colors_list: list[str] = layer["transparent_colors"]  # type: ignore[assignment]
+            payloads.append(
+                {
+                    "name": layer["title"].get().strip() or str(layer["family"]),
+                    "family": graphic_cycle[0],
+                    "enabled": True,
+                    "opacity": float(layer["opacity"].get()),
+                    "transparent_colors": transparent_colors_list,
+                    "graphic_cycle": list(graphic_cycle),
+                    "beats_per_switch": int(layer["beats_per_switch"].get()),
+                    "response_gain": float(layer["response_gain"].get()),
+                    "style_a": layer["style_a"].get(),
+                    "style_b": layer["style_b"].get(),
+                    "morph_rate": float(layer["morph_rate"].get()),
+                    "layer_count": int(layer["layer_count"].get()),
+                    "overlap": float(layer["overlap"].get()),
+                    "pattern_layout": layer["pattern_layout"].get(),
+                    "grid_strength": float(layer["grid_strength"].get()),
+                    "geometry_rigidity": float(layer["geometry_rigidity"].get()),
+                    "layer_rigidity": float(layer["layer_rigidity"].get()),
+                    "tile_overlap": float(layer["tile_overlap"].get()),
+                    "grid_columns": int(layer["grid_columns"].get()),
+                    "grid_rows": int(layer["grid_rows"].get()),
+                    "grid_pattern": layer["grid_pattern"].get(),
+                    "cell_alternation": layer["cell_alternation"].get(),
+                    "reorg_mode": layer["reorg_mode"].get(),
+                    "custom_element_paths": [str(path) for path in custom_paths],
+                }
+            )
+        return payloads
 
     def _build_command(self, preview: bool) -> list[str]:
         audio = self.audio_path.get().strip()
         if not audio:
             raise ValueError("Choose an audio file first.")
 
-        graphics = self._selected_graphics()
-        if not graphics:
-            raise ValueError("Select at least one graphic family.")
-        custom_elements = [path for path in self.custom_element_paths if path.exists()]
-        if "custom" in graphics and not custom_elements:
-            current = self.custom_element_path.get().strip()
-            if current:
-                self._append_custom_element(Path(current))
-                custom_elements = [path for path in self.custom_element_paths if path.exists()]
-        if "custom" in graphics and not custom_elements:
-            raise ValueError("Choose or paint at least one custom element before enabling the custom graphic family.")
+        layer_payloads = self._active_layer_payloads()
+        if not layer_payloads:
+            raise ValueError("Enable at least one channel.")
+        graphics_config_path = self.project_root / "cymatesserae_graphics_config.json"
+        graphics_config_path.write_text(json.dumps(layer_payloads, indent=2), encoding="utf-8")
 
         cmd = [
             sys.executable,
@@ -838,45 +1601,13 @@ class ControlPanel:
             "--plate-mode",
             str(self.plate_m.get()),
             str(self.plate_n.get()),
+            "--stack-interaction",
+            self.stack_interaction.get(),
             "--seed",
             str(self.seed.get()),
-            "--style",
-            self.style_a.get(),
-            "--style-b",
-            self.style_b.get(),
-            "--morph-rate",
-            str(self.morph_rate.get()),
-            "--layers",
-            str(self.layers.get()),
-            "--overlap",
-            str(self.overlap.get()),
-            "--pattern-layout",
-            self.pattern_layout.get(),
-            "--grid-strength",
-            str(self.grid_strength.get()),
-            "--geometry-rigidity",
-            str(self.geometry_rigidity.get()),
-            "--layer-rigidity",
-            str(self.layer_rigidity.get()),
-            "--tile-overlap",
-            str(self.tile_overlap.get()),
-            "--grid-columns",
-            str(self.grid_columns.get()),
-            "--grid-rows",
-            str(self.grid_rows.get()),
-            "--grid-pattern",
-            self.grid_pattern.get(),
-            "--cell-alternation",
-            self.cell_alternation.get(),
-            "--reorg-mode",
-            self.reorg_mode.get(),
-            "--graphic-cycle",
-            ",".join(graphics),
-            "--beats-per-switch",
-            str(self.beats_per_switch.get()),
+            "--graphics-config",
+            str(graphics_config_path),
         ]
-        if "custom" in graphics:
-            cmd.extend(["--custom-element", *[str(path) for path in custom_elements]])
         duration = self.duration.get().strip()
         if duration:
             cmd.extend(["--duration", duration])
@@ -884,7 +1615,7 @@ class ControlPanel:
         if chroma_key:
             cmd.extend(["--chroma-key-color", chroma_key])
         if preview:
-            cmd.append("--preview")
+            cmd.append("--preview-only")
         if self.cymatic.get():
             cmd.append("--cymatic")
         return cmd
@@ -923,8 +1654,33 @@ class ControlPanel:
             messagebox.showerror("Launch failed", str(exc))
             return
 
-        mode = "preview" if preview else "export"
-        self.status.set(f"Started {mode} run. Log: {self.log_path.name if self.log_path else 'n/a'}")
+        self.stop_requested = False
+        self.active_run_mode = "preview" if preview else "export"
+        mode_label = "live preview" if preview else "MP4 export"
+        self.status.set(f"Started {mode_label}. Initializing renderer and audio analysis... Log: {self.log_path.name if self.log_path else 'n/a'}")
+        self.root.after(300, self._poll_process)
+
+    def _stop_render(self) -> None:
+        process = self.running_process
+        if process is None or process.poll() is not None:
+            self.status.set("No render is currently running.")
+            return
+        self.stop_requested = True
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            try:
+                process.terminate()
+            except Exception as exc:
+                self.stop_requested = False
+                messagebox.showerror("Stop failed", str(exc))
+                return
+        self.status.set("Stopping render process...")
         self.root.after(300, self._poll_process)
 
     def _poll_process(self) -> None:
@@ -932,19 +1688,49 @@ class ControlPanel:
             return
         code = self.running_process.poll()
         if code is None:
-            self.status.set("Render running...")
+            self.status.set(self._current_runtime_status())
             self.root.after(1000, self._poll_process)
             return
         if self.log_handle is not None:
             self.log_handle.close()
             self.log_handle = None
-        if code == 0:
-            self.status.set("Render finished successfully.")
+        if self.stop_requested:
+            self.status.set("Render stopped.")
+        elif code == 0:
+            mode_label = "Live preview" if self.active_run_mode == "preview" else "Render"
+            self.status.set(f"{mode_label} finished successfully.")
         else:
             self.status.set(f"Render exited with code {code}.")
             details = self._read_log_tail()
             messagebox.showwarning("Render exited", f"The render process ended with exit code {code}.\n\n{details}")
         self.running_process = None
+        self.active_run_mode = "idle"
+        self.stop_requested = False
+
+    def _current_runtime_status(self) -> str:
+        if self.log_path is None or not self.log_path.exists():
+            return "Renderer is running. Waiting for the first log update..."
+        try:
+            lines = self.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception as exc:
+            return f"Renderer is running. Could not read progress log: {exc}"
+
+        for line in reversed(lines):
+            text = line.strip()
+            if not text:
+                continue
+            if "[cymatesserae]" in text:
+                detail = text.split("[cymatesserae]", 1)[1].strip()
+                prefix = "Live preview" if self.active_run_mode == "preview" else "Render"
+                return f"{prefix}: {detail}"
+            if "frame=" in text:
+                match = re.search(r"frame=\s*(\d+).*?fps=\s*([0-9.]+).*?speed=\s*([0-9.]+)x", text)
+                if match:
+                    frame, fps, speed = match.groups()
+                    return f"Export: encoded frame {frame} at {fps} fps, about {speed}x realtime."
+                return f"Export: {text}"
+
+        return "Renderer is running. Waiting for the first progress marker..."
 
     def _read_log_tail(self) -> str:
         if self.log_path is None or not self.log_path.exists():
