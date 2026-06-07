@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
+from .config import GraphicLayerConfig, RenderConfig
+from .project_io import load_project_file, save_project_file
 from .shared import get_app_state_dir, normalize_hex_color_text, normalize_mp4_path_text, normalize_video_dimension
 
 STYLE_OPTIONS = ("ceramic", "neon", "lava", "glass", "monolith")
@@ -657,12 +659,21 @@ class ControlPanel:
         output_button = ttk.Button(frame, text="Save As", command=self._choose_output)
         output_button.grid(row=1, column=2, padx=(10, 0), pady=4)
 
+        project_buttons = ttk.Frame(frame)
+        project_buttons.grid(row=2, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        load_project_button = ttk.Button(project_buttons, text="Load Project", command=self._load_project)
+        load_project_button.pack(side="left")
+        save_project_button = ttk.Button(project_buttons, text="Save Project", command=self._save_project)
+        save_project_button.pack(side="left", padx=(8, 0))
+
         self._tooltip(audio_label, "Path to the source audio file that will drive the animation.")
         self._tooltip(audio_entry, "You can paste a full path here or use Browse.")
         self._tooltip(audio_button, "Choose a WAV, MP3, FLAC, OGG, or M4A file.")
         self._tooltip(output_label, "Where the MP4 export should be written.")
         self._tooltip(output_entry, "Preview mode ignores this, but export mode uses it.")
         self._tooltip(output_button, "Pick the output MP4 filename and destination folder.")
+        self._tooltip(load_project_button, "Load a saved JSON project and repopulate the current controls.")
+        self._tooltip(save_project_button, "Save the current render and channel settings to a reusable JSON project.")
 
     def _build_render_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Render", padding=12)
@@ -1543,6 +1554,188 @@ class ControlPanel:
             )
         return payloads
 
+    def _layer_state_to_config(self, layer: dict[str, object]) -> GraphicLayerConfig:
+        graphic_cycle = self._selected_graphic_cycle(layer)
+        stored_paths: list[Path] = layer["custom_element_paths"]  # type: ignore[assignment]
+        transparent_colors_list: list[str] = layer["transparent_colors"]  # type: ignore[assignment]
+        transparent_colors = tuple(parse_hex_to_rgb(text) for text in transparent_colors_list)
+        return GraphicLayerConfig(
+            name=layer["title"].get().strip() or "Channel",
+            family=graphic_cycle[0] if graphic_cycle else "voronoi",
+            enabled=bool(layer["enabled"].get()),
+            opacity=float(layer["opacity"].get()),
+            transparent_colors=transparent_colors,
+            graphic_cycle=graphic_cycle,
+            beats_per_switch=int(layer["beats_per_switch"].get()),
+            response_gain=float(layer["response_gain"].get()),
+            style_a=layer["style_a"].get(),
+            style_b=layer["style_b"].get(),
+            morph_rate=float(layer["morph_rate"].get()),
+            layer_count=int(layer["layer_count"].get()),
+            overlap=float(layer["overlap"].get()),
+            pattern_layout=layer["pattern_layout"].get(),
+            grid_strength=float(layer["grid_strength"].get()),
+            geometry_rigidity=float(layer["geometry_rigidity"].get()),
+            layer_rigidity=float(layer["layer_rigidity"].get()),
+            tile_overlap=float(layer["tile_overlap"].get()),
+            grid_columns=int(layer["grid_columns"].get()),
+            grid_rows=int(layer["grid_rows"].get()),
+            grid_pattern=layer["grid_pattern"].get(),
+            cell_alternation=layer["cell_alternation"].get(),
+            reorg_mode=layer["reorg_mode"].get(),
+            custom_element_paths=tuple(path.resolve() for path in stored_paths),
+        )
+
+    def _build_project_config(self) -> RenderConfig:
+        audio = self.audio_path.get().strip()
+        if not audio:
+            raise ValueError("Choose an audio file before saving a project.")
+        duration_text = self.duration.get().strip()
+        chroma_key_text = self.chroma_key_color.get().strip()
+        graphic_layers = tuple(self._layer_state_to_config(layer) for layer in self.channels)
+        return RenderConfig(
+            audio_path=Path(audio).resolve(),
+            output_path=Path(normalize_mp4_path_text(self.output_path.get())).resolve(),
+            width=normalize_video_dimension(self.width.get()),
+            height=normalize_video_dimension(self.height.get()),
+            fps=int(self.fps.get()),
+            point_count=int(self.points.get()),
+            preview=False,
+            preview_only=False,
+            cymatic_mode=bool(self.cymatic.get()),
+            plate_mode=(int(self.plate_m.get()), int(self.plate_n.get())),
+            duration_limit=float(duration_text) if duration_text else None,
+            seed=int(self.seed.get()),
+            style_a=self.style_a.get(),
+            style_b=self.style_b.get(),
+            morph_rate=float(self.morph_rate.get()),
+            layer_count=int(self.layers.get()),
+            overlap=float(self.overlap.get()),
+            pattern_layout=self.pattern_layout.get(),
+            grid_strength=float(self.grid_strength.get()),
+            geometry_rigidity=float(self.geometry_rigidity.get()),
+            layer_rigidity=float(self.layer_rigidity.get()),
+            tile_overlap=float(self.tile_overlap.get()),
+            grid_columns=int(self.grid_columns.get()),
+            grid_rows=int(self.grid_rows.get()),
+            grid_pattern=self.grid_pattern.get(),
+            cell_alternation=self.cell_alternation.get(),
+            reorg_mode=self.reorg_mode.get(),
+            graphic_cycle=("voronoi", "circles", "scribbles", "lines", "geometrics"),
+            beats_per_switch=int(self.beats_per_switch.get()),
+            stack_interaction=self.stack_interaction.get(),
+            chroma_key_color=parse_hex_to_rgb(chroma_key_text) if chroma_key_text else None,
+            graphic_layers=graphic_layers,
+        )
+
+    def _apply_layer_config_to_state(self, state: dict[str, object], layer_config: GraphicLayerConfig) -> None:
+        state["title"].set(layer_config.name)
+        state["enabled"].set(layer_config.enabled)
+        state["opacity"].set(layer_config.opacity)
+        state["transparent_colors"] = [rgb_to_hex(color) for color in layer_config.transparent_colors]
+        state["transparent_color_path"].set("")
+        state["beats_per_switch"].set(layer_config.beats_per_switch)
+        state["response_gain"].set(layer_config.response_gain)
+        state["style_a"].set(layer_config.style_a)
+        state["style_b"].set(layer_config.style_b)
+        state["morph_rate"].set(layer_config.morph_rate)
+        state["layer_count"].set(layer_config.layer_count)
+        state["overlap"].set(layer_config.overlap)
+        state["reorg_mode"].set(layer_config.reorg_mode)
+        state["pattern_layout"].set(layer_config.pattern_layout)
+        state["grid_strength"].set(layer_config.grid_strength)
+        state["geometry_rigidity"].set(layer_config.geometry_rigidity)
+        state["layer_rigidity"].set(layer_config.layer_rigidity)
+        state["tile_overlap"].set(layer_config.tile_overlap)
+        state["grid_columns"].set(layer_config.grid_columns)
+        state["grid_rows"].set(layer_config.grid_rows)
+        state["grid_pattern"].set(layer_config.grid_pattern)
+        state["cell_alternation"].set(layer_config.cell_alternation)
+        cycle_vars: dict[str, tk.BooleanVar] = state["graphic_cycle_vars"]  # type: ignore[assignment]
+        selected = set(layer_config.graphic_cycle or (layer_config.family,))
+        for name, var in cycle_vars.items():
+            var.set(name in selected)
+        custom_paths = [Path(path) for path in layer_config.custom_element_paths]
+        state["custom_element_paths"] = custom_paths
+        if custom_paths:
+            state["custom_element_path"].set(str(custom_paths[-1]))
+        self._refresh_layer_summary(state)
+
+    def _apply_project_config(self, config: RenderConfig) -> None:
+        self.audio_path.set(str(config.audio_path))
+        self.output_path.set(str(config.output_path))
+        self.width.set(config.width)
+        self.height.set(config.height)
+        self.fps.set(config.fps)
+        self.points.set(config.point_count)
+        self.duration.set("" if config.duration_limit is None else str(config.duration_limit))
+        self.seed.set(config.seed)
+        self.cymatic.set(config.cymatic_mode)
+        self.plate_m.set(config.plate_mode[0])
+        self.plate_n.set(config.plate_mode[1])
+        self.style_a.set(config.style_a)
+        self.style_b.set(config.style_b)
+        self.morph_rate.set(config.morph_rate)
+        self.layers.set(config.layer_count)
+        self.overlap.set(config.overlap)
+        self.pattern_layout.set(config.pattern_layout)
+        self.grid_strength.set(config.grid_strength)
+        self.geometry_rigidity.set(config.geometry_rigidity)
+        self.layer_rigidity.set(config.layer_rigidity)
+        self.tile_overlap.set(config.tile_overlap)
+        self.grid_columns.set(config.grid_columns)
+        self.grid_rows.set(config.grid_rows)
+        self.grid_pattern.set(config.grid_pattern)
+        self.cell_alternation.set(config.cell_alternation)
+        self.reorg_mode.set(config.reorg_mode)
+        self.beats_per_switch.set(config.beats_per_switch)
+        self.stack_interaction.set(config.stack_interaction)
+        self.chroma_key_color.set("" if config.chroma_key_color is None else rgb_to_hex(config.chroma_key_color))
+
+        layer_configs = list(config.graphic_layers)
+        if not layer_configs:
+            layer_configs = [GraphicLayerConfig(name="Channel 1", family="voronoi", enabled=False)]
+        self.channels = []
+        self._next_channel_id = 1
+        for idx, layer_config in enumerate(layer_configs, start=1):
+            state = self._create_layer_state(layer_config.family, layer_config.name or f"Channel {idx}", custom_index=idx)
+            self._apply_layer_config_to_state(state, layer_config)
+            self.channels.append(state)
+        self._refresh_channels_popup()
+        self.status.set("Project loaded.")
+
+    def _save_project(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save Project",
+            defaultextension=".json",
+            filetypes=[("Cymatesserae Project", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            config = self._build_project_config()
+            save_project_file(Path(path), config)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc), parent=self.root)
+            return
+        self.status.set(f"Project saved to {Path(path).name}.")
+
+    def _load_project(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Load Project",
+            filetypes=[("Cymatesserae Project", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            config = load_project_file(Path(path))
+            self._apply_project_config(config)
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc), parent=self.root)
+            return
+
     def _build_command(self, preview: bool) -> list[str]:
         audio = self.audio_path.get().strip()
         if not audio:
@@ -1725,3 +1918,12 @@ def launch_gui() -> None:
     ttk.Style(root).theme_use("clam")
     panel = ControlPanel(root)
     root.mainloop()
+
+
+def parse_hex_to_rgb(text: str) -> tuple[int, int, int]:
+    normalized = normalize_hex_color_text(text)
+    return tuple(int(normalized[idx : idx + 2], 16) for idx in (0, 2, 4))
+
+
+def rgb_to_hex(color: tuple[int, int, int]) -> str:
+    return "".join(f"{channel:02x}" for channel in color)
