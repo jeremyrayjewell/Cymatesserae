@@ -239,7 +239,15 @@ def main() -> int:
         launch_gui()
         return 0
 
-    project_config = load_project_file(args.project) if args.project is not None else None
+    if args.project is not None:
+        try:
+            project_config = load_project_file(args.project)
+        except FileNotFoundError:
+            raise SystemExit(f"Could not load project file: file not found: {args.project}")
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"Could not load project file: {exc}")
+    else:
+        project_config = None
     audio_arg = args.audio if args.audio is not None else (project_config.audio_path if project_config is not None else None)
 
     if audio_arg is None:

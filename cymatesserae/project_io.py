@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 from pathlib import Path
 from typing import Any
@@ -14,9 +15,9 @@ PROJECT_VERSION = 1
 
 def _serialize_path(path: Path, base_dir: Path) -> str:
     try:
-        return path.resolve().relative_to(base_dir.resolve()).as_posix()
+        return Path(os.path.relpath(path.resolve(), base_dir.resolve())).as_posix()
     except ValueError:
-        return str(path)
+        return str(path.resolve())
 
 
 def _deserialize_path(value: str | Path, base_dir: Path) -> Path:
@@ -146,6 +147,8 @@ def render_config_to_project_dict(config: RenderConfig, base_dir: Path) -> dict[
 
 def render_config_from_project_dict(data: dict[str, Any], base_dir: Path) -> RenderConfig:
     render = data.get("render_config", data)
+    if not isinstance(render, dict):
+        raise ValueError("Project file has an invalid render_config section.")
     audio_path_value = render.get("audio_path")
     if not audio_path_value:
         raise ValueError("Project file is missing audio_path.")
@@ -203,5 +206,25 @@ def save_project_file(path: Path, config: RenderConfig) -> None:
 
 
 def load_project_file(path: Path) -> RenderConfig:
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    return render_config_from_project_dict(raw, path.parent)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("Project file is not valid JSON.") from exc
+
+    if not isinstance(raw, dict):
+        raise ValueError("Project file must contain a JSON object.")
+
+    project_format = raw.get("format")
+    if project_format is not None and project_format != PROJECT_FORMAT:
+        raise ValueError(f"Unsupported project format: {project_format!r}.")
+
+    version = raw.get("version")
+    if version is not None and version != PROJECT_VERSION:
+        raise ValueError(f"Unsupported project version: {version!r}.")
+
+    try:
+        return render_config_from_project_dict(raw, path.parent)
+    except (TypeError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("Project file"):
+            raise
+        raise ValueError(f"Project file has invalid settings: {exc}") from exc

@@ -161,6 +161,7 @@ GUI workflow:
 CLI workflow:
 
 - pass `--project path\to\project.json` to load a saved project
+- explicit CLI arguments override values loaded from the project file
 - normal CLI usage without `--project` still works as before
 
 Minimal example:
@@ -168,6 +169,8 @@ Minimal example:
 ```powershell
 python -m cymatesserae --project ".\my-project.json"
 ```
+
+Paths are saved relative to the project file when practical and resolved again from the project file location when the project is loaded.
 
 ---
 
