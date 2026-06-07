@@ -253,6 +253,8 @@ def _draw_custom(
                 sprite_index,
                 width,
                 height,
+                surface.get_width(),
+                surface.get_height(),
                 angle,
                 invert_color,
                 flip_xy,

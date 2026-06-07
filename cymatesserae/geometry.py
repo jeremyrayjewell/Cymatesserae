@@ -358,6 +358,31 @@ def invert_custom_surface(surface: pygame.Surface) -> pygame.Surface:
     return inverted
 
 
+CUSTOM_SCALE_CACHE_LIMIT = 96
+CUSTOM_TRANSFORM_CACHE_LIMIT = 192
+CUSTOM_MAX_SURFACE_DIMENSION_MULTIPLIER = 1.25
+CUSTOM_MAX_SURFACE_AREA_MULTIPLIER = 1.25
+CUSTOM_CACHEABLE_SURFACE_AREA_MULTIPLIER = 0.35
+
+
+def clamp_custom_surface_size(width: int, height: int, render_width: int, render_height: int) -> tuple[int, int]:
+    width = max(8, int(width))
+    height = max(8, int(height))
+    max_width = max(8, int(render_width * CUSTOM_MAX_SURFACE_DIMENSION_MULTIPLIER))
+    max_height = max(8, int(render_height * CUSTOM_MAX_SURFACE_DIMENSION_MULTIPLIER))
+    scale = min(max_width / width, max_height / height, 1.0)
+    max_area = max(64, int(render_width * render_height * CUSTOM_MAX_SURFACE_AREA_MULTIPLIER))
+    scaled_area = width * height * (scale ** 2)
+    if scaled_area > max_area:
+        scale = min(scale, (max_area / max(width * height, 1)) ** 0.5)
+    return max(8, int(width * scale)), max(8, int(height * scale))
+
+
+def _should_cache_custom_surface(width: int, height: int, render_width: int, render_height: int) -> bool:
+    max_cacheable_area = max(64, int(render_width * render_height * CUSTOM_CACHEABLE_SURFACE_AREA_MULTIPLIER))
+    return width * height <= max_cacheable_area
+
+
 def get_scaled_custom_surface(
     sprite_index: int,
     width: int,
@@ -372,8 +397,15 @@ def get_scaled_custom_surface(
     if cached is not None:
         return cached
     source_list = inverted_custom_elements if inverted else custom_elements
-    scaled = pygame.transform.scale(source_list[sprite_index], (width, height))
-    if len(scale_cache) > 512:
+    source = source_list[sprite_index]
+    if source.get_width() == width and source.get_height() == height:
+        scaled = source
+    else:
+        try:
+            scaled = pygame.transform.scale(source, (width, height))
+        except pygame.error:
+            scaled = source
+    if len(scale_cache) >= CUSTOM_SCALE_CACHE_LIMIT:
         scale_cache.clear()
     scale_cache[key] = scaled
     return scaled
@@ -383,6 +415,8 @@ def get_transformed_custom_surface(
     sprite_index: int,
     width: int,
     height: int,
+    render_width: int,
+    render_height: int,
     angle: float,
     inverted: bool,
     flip_xy: bool,
@@ -392,6 +426,7 @@ def get_transformed_custom_surface(
     transform_cache: dict[tuple[int, int, int, int, bool, bool], pygame.Surface],
     fast_preview: bool,
 ) -> pygame.Surface:
+    width, height = clamp_custom_surface_size(width, height, render_width, render_height)
     scaled = get_scaled_custom_surface(
         sprite_index,
         width,
@@ -401,18 +436,25 @@ def get_transformed_custom_surface(
         inverted_custom_elements,
         scale_cache,
     )
+    transformed = pygame.transform.flip(scaled, True, True) if flip_xy else scaled
     if not fast_preview:
-        transformed = pygame.transform.flip(scaled, True, True) if flip_xy else scaled
-        return pygame.transform.rotate(transformed, angle)
+        try:
+            return pygame.transform.rotate(transformed, angle)
+        except pygame.error:
+            return transformed
 
     angle_bucket = int(round(angle / 12.0)) * 12
     key = (sprite_index, width, height, angle_bucket, inverted, flip_xy)
     cached = transform_cache.get(key)
     if cached is not None:
         return cached
-    transformed = pygame.transform.flip(scaled, True, True) if flip_xy else scaled
-    rotated = pygame.transform.rotate(transformed, float(angle_bucket))
-    if len(transform_cache) > 1024:
+    try:
+        rotated = pygame.transform.rotate(transformed, float(angle_bucket))
+    except pygame.error:
+        return transformed
+    if not _should_cache_custom_surface(rotated.get_width(), rotated.get_height(), render_width, render_height):
+        return rotated
+    if len(transform_cache) >= CUSTOM_TRANSFORM_CACHE_LIMIT:
         transform_cache.clear()
     transform_cache[key] = rotated
     return rotated
