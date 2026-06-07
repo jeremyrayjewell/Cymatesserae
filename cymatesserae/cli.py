@@ -5,35 +5,10 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .shared import normalize_output_path, normalize_video_dimension, parse_chroma_key_color
+
 if TYPE_CHECKING:
     from .renderer import GraphicLayerConfig, RenderConfig
-
-
-def parse_chroma_key_color(value: str) -> tuple[int, int, int]:
-    text = value.strip()
-    if text.startswith("#"):
-        text = text[1:]
-    if len(text) != 6:
-        raise argparse.ArgumentTypeError("Chroma key color must be a 6-digit hex value like 00ff00 or #00ff00.")
-    try:
-        return tuple(int(text[idx : idx + 2], 16) for idx in (0, 2, 4))
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("Chroma key color must be valid hexadecimal.") from exc
-
-
-def normalize_output_path(path: Path) -> Path:
-    if path.suffix.lower() == ".mp4":
-        return path
-    if path.suffix:
-        return path.with_suffix(".mp4")
-    return path.with_name(f"{path.name}.mp4")
-
-
-def normalize_video_dimension(value: int) -> int:
-    number = max(2, int(value))
-    if number % 2 == 0:
-        return number
-    return number + 1
 
 
 def load_graphic_layers(path: Path | None) -> tuple[GraphicLayerConfig, ...]:

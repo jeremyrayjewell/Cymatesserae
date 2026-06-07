@@ -6,10 +6,13 @@ import math
 import re
 import subprocess
 import sys
+import tempfile
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
+
+from .shared import get_app_state_dir, normalize_hex_color_text, normalize_mp4_path_text, normalize_video_dimension
 
 STYLE_OPTIONS = ("ceramic", "neon", "lava", "glass", "monolith")
 REORG_OPTIONS = ("burst", "swirl", "split", "shockwave")
@@ -69,39 +72,6 @@ CUSTOM_ELEMENT_PALETTE = (
     "#ff2d55",
     "#8e8e93",
 )
-
-
-def normalize_mp4_path_text(path_text: str) -> str:
-    text = path_text.strip()
-    if not text:
-        return "cymatesserae_output.mp4"
-    path = Path(text)
-    if path.suffix.lower() == ".mp4":
-        return str(path)
-    if path.suffix:
-        return str(path.with_suffix(".mp4"))
-    return str(path.with_name(f"{path.name}.mp4"))
-
-
-def normalize_video_dimension(value: int) -> int:
-    number = max(2, int(value))
-    if number % 2 == 0:
-        return number
-    return number + 1
-
-
-def normalize_hex_color_text(value: str) -> str:
-    text = value.strip().lower()
-    if not text:
-        return ""
-    if text.startswith("#"):
-        text = text[1:]
-    if len(text) != 6:
-        raise ValueError("Color must be a 6-digit hex value like 00ff00.")
-    int(text, 16)
-    return text
-
-
 def _position_toplevel_near_parent(window: tk.Toplevel, parent: tk.Widget, offset_x: int = 40, offset_y: int = 40) -> None:
     try:
         anchor = parent.winfo_toplevel()
@@ -576,6 +546,7 @@ class ControlPanel:
         self.root.title("Cymatesserae Control Panel")
         self.root.geometry("860x560")
         self.project_root = Path(__file__).resolve().parents[1]
+        self.app_state_dir = get_app_state_dir()
 
         self.audio_path = tk.StringVar()
         self.output_path = tk.StringVar(value="cymatesserae_output.mp4")
@@ -1580,7 +1551,9 @@ class ControlPanel:
         layer_payloads = self._active_layer_payloads()
         if not layer_payloads:
             raise ValueError("Enable at least one channel.")
-        graphics_config_path = self.project_root / "cymatesserae_graphics_config.json"
+        self.app_state_dir.mkdir(parents=True, exist_ok=True)
+        config_dir = Path(tempfile.mkdtemp(prefix="gui-run-", dir=self.app_state_dir))
+        graphics_config_path = config_dir / "graphics_config.json"
         graphics_config_path.write_text(json.dumps(layer_payloads, indent=2), encoding="utf-8")
 
         cmd = [
@@ -1636,7 +1609,8 @@ class ControlPanel:
 
         try:
             cwd = self.project_root
-            self.log_path = cwd / "cymatesserae_gui_last_run.log"
+            self.app_state_dir.mkdir(parents=True, exist_ok=True)
+            self.log_path = self.app_state_dir / "cymatesserae_gui_last_run.log"
             self.log_handle = self.log_path.open("w", encoding="utf-8")
             self.log_handle.write(f"[{datetime.now().isoformat(timespec='seconds')}] {' '.join(cmd)}\n\n")
             self.log_handle.flush()
