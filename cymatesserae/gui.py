@@ -13,7 +13,14 @@ from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
 from .config import GraphicLayerConfig, RenderConfig
-from .project_io import load_preset_file, load_project_file, save_preset_file, save_project_file
+from .project_io import (
+    default_user_presets_dir,
+    discover_preset_files,
+    load_preset_file,
+    load_project_file,
+    save_preset_file,
+    save_project_file,
+)
 from .shared import get_app_state_dir, normalize_hex_color_text, normalize_mp4_path_text, normalize_video_dimension
 
 STYLE_OPTIONS = ("ceramic", "neon", "lava", "glass", "monolith")
@@ -549,9 +556,12 @@ class ControlPanel:
         self.root.geometry("860x560")
         self.project_root = Path(__file__).resolve().parents[1]
         self.app_state_dir = get_app_state_dir()
+        self.builtin_presets_dir = self.project_root / "presets"
+        self.user_presets_dir = default_user_presets_dir()
 
         self.audio_path = tk.StringVar()
         self.output_path = tk.StringVar(value="cymatesserae_output.mp4")
+        self.preset_choice = tk.StringVar()
         self.width = tk.IntVar(value=1280)
         self.height = tk.IntVar(value=720)
         self.link_dimensions = tk.BooleanVar(value=False)
@@ -596,8 +606,11 @@ class ControlPanel:
         self._dimension_link_ratio = self.width.get() / max(self.height.get(), 1)
         self._dimension_link_guard = False
         self.dimension_link_button: tk.Canvas | None = None
+        self.preset_combo: ttk.Combobox | None = None
+        self.discovered_presets: tuple[tuple[str, Path, str], ...] = ()
 
         self._build()
+        self._refresh_preset_browser()
         self._bind_dimension_linking()
         self._size_main_window_to_content()
 
@@ -670,6 +683,18 @@ class ControlPanel:
         save_preset_button = ttk.Button(project_buttons, text="Save Preset", command=self._save_preset)
         save_preset_button.pack(side="left", padx=(8, 0))
 
+        preset_browser_label = ttk.Label(frame, text="Preset Browser")
+        preset_browser_label.grid(row=3, column=0, sticky="w", padx=(0, 10), pady=(10, 4))
+        preset_browser = ttk.Frame(frame)
+        preset_browser.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(10, 4))
+        preset_browser.columnconfigure(0, weight=1)
+        self.preset_combo = ttk.Combobox(preset_browser, textvariable=self.preset_choice, state="readonly")
+        self.preset_combo.grid(row=0, column=0, sticky="ew")
+        apply_preset_button = ttk.Button(preset_browser, text="Apply", command=self._apply_selected_browser_preset)
+        apply_preset_button.grid(row=0, column=1, padx=(8, 0))
+        refresh_preset_button = ttk.Button(preset_browser, text="Refresh", command=self._refresh_preset_browser)
+        refresh_preset_button.grid(row=0, column=2, padx=(8, 0))
+
         self._tooltip(audio_label, "Path to the source audio file that will drive the animation.")
         self._tooltip(audio_entry, "You can paste a full path here or use Browse.")
         self._tooltip(audio_button, "Choose a WAV, MP3, FLAC, OGG, or M4A file.")
@@ -680,6 +705,10 @@ class ControlPanel:
         self._tooltip(save_project_button, "Save the current render and channel settings to a reusable JSON project.")
         self._tooltip(load_preset_button, "Load a saved visual preset and apply it without replacing the current audio or output path.")
         self._tooltip(save_preset_button, "Save the current visual settings and channels as a reusable preset.")
+        self._tooltip(preset_browser_label, "Built-in and user presets discovered automatically for quick reuse.")
+        self._tooltip(self.preset_combo, "Pick a built-in or user preset and apply it without browsing for a file.")
+        self._tooltip(apply_preset_button, "Apply the selected preset while preserving the current audio and output path.")
+        self._tooltip(refresh_preset_button, "Rescan the built-in and user preset folders.")
 
     def _build_render_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Render", padding=12)
@@ -1751,6 +1780,49 @@ class ControlPanel:
         self._refresh_channels_popup()
         self.status.set("Project loaded.")
 
+    def _preset_label(self, name: str, source: str) -> str:
+        prefix = "Built-in" if source == "built-in" else "User"
+        return f"{name} ({prefix})"
+
+    def _refresh_preset_browser(self) -> None:
+        presets = discover_preset_files(self.builtin_presets_dir, self.user_presets_dir)
+        self.discovered_presets = tuple((preset.name, preset.path, preset.source) for preset in presets)
+        if self.preset_combo is None:
+            return
+        labels = [self._preset_label(name, source) for name, _path, source in self.discovered_presets]
+        self.preset_combo["values"] = labels
+        current = self.preset_choice.get()
+        if current in labels:
+            return
+        self.preset_choice.set(labels[0] if labels else "")
+
+    def _apply_preset_config(self, config: RenderConfig) -> None:
+        audio_before = self.audio_path.get()
+        output_before = self.output_path.get()
+        self._apply_project_config(config)
+        self.audio_path.set(audio_before)
+        self.output_path.set(output_before)
+
+    def _apply_preset_path(self, path: Path) -> None:
+        base_config = self._build_preset_source_config()
+        config = load_preset_file(path, base_config)
+        self._apply_preset_config(config)
+        self.status.set(f"Preset applied: {path.stem}.")
+
+    def _apply_selected_browser_preset(self) -> None:
+        selected = self.preset_choice.get()
+        if not selected:
+            messagebox.showinfo("Preset Browser", "No preset is selected.", parent=self.root)
+            return
+        for name, path, source in self.discovered_presets:
+            if self._preset_label(name, source) == selected:
+                try:
+                    self._apply_preset_path(path)
+                except Exception as exc:
+                    messagebox.showerror("Load failed", str(exc), parent=self.root)
+                return
+        messagebox.showerror("Load failed", "The selected preset is no longer available. Try Refresh.", parent=self.root)
+
     def _save_project(self) -> None:
         path = filedialog.asksaveasfilename(
             parent=self.root,
@@ -1784,10 +1856,12 @@ class ControlPanel:
             return
 
     def _save_preset(self) -> None:
+        self.user_presets_dir.mkdir(parents=True, exist_ok=True)
         path = filedialog.asksaveasfilename(
             parent=self.root,
             title="Save Preset",
             defaultextension=".json",
+            initialdir=str(self.user_presets_dir),
             filetypes=[("Cymatesserae Preset", "*.json"), ("All files", "*.*")],
         )
         if not path:
@@ -1798,28 +1872,24 @@ class ControlPanel:
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc), parent=self.root)
             return
+        self._refresh_preset_browser()
         self.status.set(f"Preset saved to {Path(path).name}.")
 
     def _load_preset(self) -> None:
+        initial_dir = self.user_presets_dir if self.user_presets_dir.exists() else self.builtin_presets_dir
         path = filedialog.askopenfilename(
             parent=self.root,
             title="Load Preset",
+            initialdir=str(initial_dir),
             filetypes=[("Cymatesserae Preset", "*.json"), ("All files", "*.*")],
         )
         if not path:
             return
-        audio_before = self.audio_path.get()
-        output_before = self.output_path.get()
         try:
-            base_config = self._build_preset_source_config()
-            config = load_preset_file(Path(path), base_config)
-            self._apply_project_config(config)
-            self.audio_path.set(audio_before)
-            self.output_path.set(output_before)
+            self._apply_preset_path(Path(path))
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc), parent=self.root)
             return
-        self.status.set("Preset applied.")
 
     def _build_command(self, preview: bool) -> list[str]:
         audio = self.audio_path.get().strip()

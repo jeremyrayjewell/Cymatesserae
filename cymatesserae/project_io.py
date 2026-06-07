@@ -6,13 +6,32 @@ from pathlib import Path
 from typing import Any
 
 from .config import GraphicLayerConfig, RenderConfig
-from .shared import normalize_output_path, parse_chroma_key_color
+from .shared import get_app_state_dir, normalize_output_path, parse_chroma_key_color
 
 
 PROJECT_FORMAT = "cymatesserae-project"
 PROJECT_VERSION = 1
 PRESET_FORMAT = "cymatesserae-preset"
 PRESET_VERSION = 1
+
+
+class PresetInfo(tuple):
+    __slots__ = ()
+
+    def __new__(cls, name: str, path: Path, source: str):
+        return super().__new__(cls, (name, path, source))
+
+    @property
+    def name(self) -> str:
+        return self[0]
+
+    @property
+    def path(self) -> Path:
+        return self[1]
+
+    @property
+    def source(self) -> str:
+        return self[2]
 
 
 def _serialize_path(path: Path, base_dir: Path) -> str:
@@ -302,6 +321,34 @@ def save_preset_file(path: Path, config: RenderConfig) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = render_config_to_preset_dict(config, path.parent)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def default_user_presets_dir() -> Path:
+    return get_app_state_dir() / "presets"
+
+
+def discover_preset_files(*directories: Path) -> tuple[PresetInfo, ...]:
+    seen: set[Path] = set()
+    presets: list[PresetInfo] = []
+    for directory in directories:
+        if not directory.exists() or not directory.is_dir():
+            continue
+        source = "user" if directory == default_user_presets_dir() else "built-in"
+        for path in sorted(directory.glob("*.json")):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            label = path.stem.replace("_", " ").replace("-", " ").strip() or path.name
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    label = str(raw.get("name", label))
+            except Exception:
+                pass
+            presets.append(PresetInfo(label, resolved, source))
+    presets.sort(key=lambda item: (item.name.lower(), item.source, str(item.path).lower()))
+    return tuple(presets)
 
 
 def load_project_file(path: Path) -> RenderConfig:

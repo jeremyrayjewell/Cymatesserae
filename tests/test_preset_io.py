@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 
 from cymatesserae.config import GraphicLayerConfig, RenderConfig
-from cymatesserae.project_io import load_preset_file, save_preset_file
+from cymatesserae import project_io
+from cymatesserae.project_io import discover_preset_files, load_preset_file, save_preset_file
 
 
 def test_preset_file_round_trip(tmp_path: Path) -> None:
@@ -111,3 +112,40 @@ def test_load_preset_file_preserves_audio_and_output_paths(tmp_path: Path) -> No
     assert applied.output_path == base.output_path
     assert applied.style_a == "lava"
     assert applied.graphic_layers[0].custom_element_paths == (custom_path.resolve(),)
+
+
+def test_discover_preset_files_uses_name_field_and_sorts_results(tmp_path: Path, monkeypatch) -> None:
+    builtin_dir = tmp_path / "builtin"
+    user_dir = tmp_path / "user"
+    builtin_dir.mkdir()
+    user_dir.mkdir()
+
+    (builtin_dir / "beta.json").write_text(
+        json.dumps({"format": "cymatesserae-preset", "version": 1, "name": "Beta Glow", "preset": {}}),
+        encoding="utf-8",
+    )
+    (builtin_dir / "alpha.json").write_text(
+        json.dumps({"format": "cymatesserae-preset", "version": 1, "preset": {}}),
+        encoding="utf-8",
+    )
+    (user_dir / "gamma.json").write_text(
+        json.dumps({"format": "cymatesserae-preset", "version": 1, "name": "Gamma Drift", "preset": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(project_io, "default_user_presets_dir", lambda: user_dir)
+
+    discovered = discover_preset_files(builtin_dir, user_dir)
+
+    assert [(preset.name, preset.source) for preset in discovered] == [
+        ("alpha", "built-in"),
+        ("Beta Glow", "built-in"),
+        ("Gamma Drift", "user"),
+    ]
+    assert discovered[0].path == (builtin_dir / "alpha.json")
+    assert discovered[2].path == (user_dir / "gamma.json")
+
+
+def test_discover_preset_files_ignores_missing_directories(tmp_path: Path) -> None:
+    discovered = discover_preset_files(tmp_path / "missing-one", tmp_path / "missing-two")
+
+    assert discovered == ()

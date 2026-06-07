@@ -141,6 +141,7 @@ It also supports:
 
 - `Save Project` for writing the current render and channel setup to a JSON project file
 - `Load Project` for restoring a saved project file into the current controls
+- a preset browser for applying built-in and user presets without manually browsing for a file
 - `Save Preset` for storing reusable visual settings without audio/output paths
 - `Load Preset` for applying a saved look to the current setup without replacing the selected audio or output path
 
@@ -193,8 +194,14 @@ Preset files can include style, morph, grid/layout, channel, and per-layer visua
 
 GUI workflow:
 
+- use the preset browser to quickly apply built-in presets from `presets/`
+- saved presets are easy to reuse from the browser and can also be loaded directly from disk
 - use `Save Preset` to store the current look
 - use `Load Preset` to apply a saved look without replacing the selected audio or output path
+
+Built-in presets live in `presets/`.
+
+User presets can also be stored in the app-state presets folder and will appear in the same browser.
 
 CLI workflow:
 
