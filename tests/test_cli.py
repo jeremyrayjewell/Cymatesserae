@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from cymatesserae import cli
 from cymatesserae.config import GraphicLayerConfig, RenderConfig
 from cymatesserae.project_io import save_project_file
@@ -99,3 +101,67 @@ def test_cli_main_loads_project_file(monkeypatch, tmp_path: Path, generated_wav:
     assert config.point_count == 50
     assert config.cymatic_mode is True
     assert len(config.graphic_layers) == 1
+
+
+def test_cli_main_project_values_can_be_overridden(monkeypatch, tmp_path: Path, generated_wav: Path) -> None:
+    project_path = tmp_path / "project.json"
+    captured: dict[str, object] = {}
+
+    def fake_render_project(config) -> None:
+        captured["config"] = config
+
+    save_project_file(
+        project_path,
+        RenderConfig(
+            audio_path=generated_wav,
+            output_path=tmp_path / "base.mp4",
+            width=400,
+            height=222,
+            fps=15,
+            point_count=50,
+            cymatic_mode=False,
+        ),
+    )
+
+    monkeypatch.setattr("cymatesserae.renderer.render_project", fake_render_project)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "cymatesserae",
+            "--project",
+            str(project_path),
+            "--width",
+            "321",
+            "--fps",
+            "12",
+            "--cymatic",
+            "--output",
+            str(tmp_path / "override"),
+        ],
+    )
+
+    cli.main()
+    config = captured["config"]
+
+    assert config.width == 322
+    assert config.height == 222
+    assert config.fps == 12
+    assert config.cymatic_mode is True
+    assert config.output_path == (tmp_path / "override.mp4")
+
+
+def test_cli_main_project_load_errors_are_friendly_for_missing_file(monkeypatch, tmp_path: Path) -> None:
+    missing = tmp_path / "missing.json"
+    monkeypatch.setattr("sys.argv", ["cymatesserae", "--project", str(missing)])
+
+    with pytest.raises(SystemExit, match="Could not load project file: file not found"):
+        cli.main()
+
+
+def test_cli_main_project_load_errors_are_friendly_for_bad_json(monkeypatch, tmp_path: Path) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text("{bad json", encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["cymatesserae", "--project", str(bad)])
+
+    with pytest.raises(SystemExit, match="Could not load project file: Project file is not valid JSON."):
+        cli.main()

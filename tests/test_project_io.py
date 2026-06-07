@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from cymatesserae.config import GraphicLayerConfig, RenderConfig
 from cymatesserae.project_io import load_project_file, save_project_file
@@ -91,3 +94,67 @@ def test_project_file_round_trip(tmp_path: Path) -> None:
     assert len(restored.graphic_layers) == 1
     assert restored.graphic_layers[0].name == "Layer A"
     assert restored.graphic_layers[0].custom_element_paths == (custom_path.resolve(),)
+
+
+def test_project_file_uses_relative_paths_when_practical(tmp_path: Path) -> None:
+    project_dir = tmp_path / "projects"
+    asset_dir = tmp_path / "assets"
+    project_dir.mkdir()
+    asset_dir.mkdir()
+    audio_path = asset_dir / "audio.wav"
+    output_path = asset_dir / "output.mp4"
+    audio_path.write_bytes(b"audio")
+
+    config = RenderConfig(audio_path=audio_path, output_path=output_path)
+    project_path = project_dir / "project.json"
+    save_project_file(project_path, config)
+
+    raw = json.loads(project_path.read_text(encoding="utf-8"))
+    assert raw["render_config"]["audio_path"] == "../assets/audio.wav"
+    assert raw["render_config"]["output_path"] == "../assets/output.mp4"
+
+
+def test_load_project_file_rejects_non_object_json(tmp_path: Path) -> None:
+    project_path = tmp_path / "project.json"
+    project_path.write_text('["not", "an", "object"]', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="JSON object"):
+        load_project_file(project_path)
+
+
+def test_load_project_file_rejects_malformed_json(tmp_path: Path) -> None:
+    project_path = tmp_path / "project.json"
+    project_path.write_text("{bad json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        load_project_file(project_path)
+
+
+def test_load_project_file_rejects_unsupported_format(tmp_path: Path) -> None:
+    project_path = tmp_path / "project.json"
+    project_path.write_text(json.dumps({"format": "other", "version": 1, "render_config": {"audio_path": "a.wav"}}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unsupported project format"):
+        load_project_file(project_path)
+
+
+def test_load_project_file_rejects_unsupported_version(tmp_path: Path) -> None:
+    project_path = tmp_path / "project.json"
+    project_path.write_text(
+        json.dumps({"format": "cymatesserae-project", "version": 99, "render_config": {"audio_path": "a.wav"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported project version"):
+        load_project_file(project_path)
+
+
+def test_load_project_file_rejects_wrong_render_config_shape(tmp_path: Path) -> None:
+    project_path = tmp_path / "project.json"
+    project_path.write_text(
+        json.dumps({"format": "cymatesserae-project", "version": 1, "render_config": ["wrong"]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid render_config"):
+        load_project_file(project_path)
