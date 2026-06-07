@@ -13,7 +13,7 @@ from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
 from .config import GraphicLayerConfig, RenderConfig
-from .project_io import load_project_file, save_project_file
+from .project_io import load_preset_file, load_project_file, save_preset_file, save_project_file
 from .shared import get_app_state_dir, normalize_hex_color_text, normalize_mp4_path_text, normalize_video_dimension
 
 STYLE_OPTIONS = ("ceramic", "neon", "lava", "glass", "monolith")
@@ -665,6 +665,10 @@ class ControlPanel:
         load_project_button.pack(side="left")
         save_project_button = ttk.Button(project_buttons, text="Save Project", command=self._save_project)
         save_project_button.pack(side="left", padx=(8, 0))
+        load_preset_button = ttk.Button(project_buttons, text="Load Preset", command=self._load_preset)
+        load_preset_button.pack(side="left", padx=(8, 0))
+        save_preset_button = ttk.Button(project_buttons, text="Save Preset", command=self._save_preset)
+        save_preset_button.pack(side="left", padx=(8, 0))
 
         self._tooltip(audio_label, "Path to the source audio file that will drive the animation.")
         self._tooltip(audio_entry, "You can paste a full path here or use Browse.")
@@ -674,6 +678,8 @@ class ControlPanel:
         self._tooltip(output_button, "Pick the output MP4 filename and destination folder.")
         self._tooltip(load_project_button, "Load a saved JSON project and repopulate the current controls.")
         self._tooltip(save_project_button, "Save the current render and channel settings to a reusable JSON project.")
+        self._tooltip(load_preset_button, "Load a saved visual preset and apply it without replacing the current audio or output path.")
+        self._tooltip(save_preset_button, "Save the current visual settings and channels as a reusable preset.")
 
     def _build_render_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Render", padding=12)
@@ -1628,6 +1634,47 @@ class ControlPanel:
             graphic_layers=graphic_layers,
         )
 
+    def _build_preset_source_config(self) -> RenderConfig:
+        duration_text = self.duration.get().strip()
+        chroma_key_text = self.chroma_key_color.get().strip()
+        graphic_layers = tuple(self._layer_state_to_config(layer) for layer in self.channels)
+        audio_text = self.audio_path.get().strip() or "preset-placeholder.wav"
+        output_text = normalize_mp4_path_text(self.output_path.get()) if self.output_path.get().strip() else "preset-placeholder.mp4"
+        return RenderConfig(
+            audio_path=Path(audio_text).resolve(),
+            output_path=Path(output_text).resolve(),
+            width=normalize_video_dimension(self.width.get()),
+            height=normalize_video_dimension(self.height.get()),
+            fps=int(self.fps.get()),
+            point_count=int(self.points.get()),
+            preview=False,
+            preview_only=False,
+            cymatic_mode=bool(self.cymatic.get()),
+            plate_mode=(int(self.plate_m.get()), int(self.plate_n.get())),
+            duration_limit=float(duration_text) if duration_text else None,
+            seed=int(self.seed.get()),
+            style_a=self.style_a.get(),
+            style_b=self.style_b.get(),
+            morph_rate=float(self.morph_rate.get()),
+            layer_count=int(self.layers.get()),
+            overlap=float(self.overlap.get()),
+            pattern_layout=self.pattern_layout.get(),
+            grid_strength=float(self.grid_strength.get()),
+            geometry_rigidity=float(self.geometry_rigidity.get()),
+            layer_rigidity=float(self.layer_rigidity.get()),
+            tile_overlap=float(self.tile_overlap.get()),
+            grid_columns=int(self.grid_columns.get()),
+            grid_rows=int(self.grid_rows.get()),
+            grid_pattern=self.grid_pattern.get(),
+            cell_alternation=self.cell_alternation.get(),
+            reorg_mode=self.reorg_mode.get(),
+            graphic_cycle=("voronoi", "circles", "scribbles", "lines", "geometrics"),
+            beats_per_switch=int(self.beats_per_switch.get()),
+            stack_interaction=self.stack_interaction.get(),
+            chroma_key_color=parse_hex_to_rgb(chroma_key_text) if chroma_key_text else None,
+            graphic_layers=graphic_layers,
+        )
+
     def _apply_layer_config_to_state(self, state: dict[str, object], layer_config: GraphicLayerConfig) -> None:
         state["title"].set(layer_config.name)
         state["enabled"].set(layer_config.enabled)
@@ -1735,6 +1782,44 @@ class ControlPanel:
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc), parent=self.root)
             return
+
+    def _save_preset(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save Preset",
+            defaultextension=".json",
+            filetypes=[("Cymatesserae Preset", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            config = self._build_preset_source_config()
+            save_preset_file(Path(path), config)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc), parent=self.root)
+            return
+        self.status.set(f"Preset saved to {Path(path).name}.")
+
+    def _load_preset(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Load Preset",
+            filetypes=[("Cymatesserae Preset", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        audio_before = self.audio_path.get()
+        output_before = self.output_path.get()
+        try:
+            base_config = self._build_preset_source_config()
+            config = load_preset_file(Path(path), base_config)
+            self._apply_project_config(config)
+            self.audio_path.set(audio_before)
+            self.output_path.set(output_before)
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc), parent=self.root)
+            return
+        self.status.set("Preset applied.")
 
     def _build_command(self, preview: bool) -> list[str]:
         audio = self.audio_path.get().strip()

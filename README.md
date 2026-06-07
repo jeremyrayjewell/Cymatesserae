@@ -62,6 +62,12 @@ Load a saved project from the CLI:
 python -m cymatesserae --project ".\my-project.json"
 ```
 
+Apply a saved visual preset from the CLI:
+
+```powershell
+python -m cymatesserae ".\input.wav" --preset ".\my-look.json"
+```
+
 Export an MP4:
 
 ```powershell
@@ -135,6 +141,8 @@ It also supports:
 
 - `Save Project` for writing the current render and channel setup to a JSON project file
 - `Load Project` for restoring a saved project file into the current controls
+- `Save Preset` for storing reusable visual settings without audio/output paths
+- `Load Preset` for applying a saved look to the current setup without replacing the selected audio or output path
 
 If a GUI render fails, the latest run is logged to:
 
@@ -171,6 +179,36 @@ python -m cymatesserae --project ".\my-project.json"
 ```
 
 Paths are saved relative to the project file when practical and resolved again from the project file location when the project is loaded.
+
+---
+
+## Presets
+
+Presets are separate from project files.
+
+- project files store a full render setup, including audio and output paths
+- presets store reusable visual settings only, so the same look can be applied to different audio files
+
+Preset files can include style, morph, grid/layout, channel, and per-layer visual settings, along with custom element references when needed.
+
+GUI workflow:
+
+- use `Save Preset` to store the current look
+- use `Load Preset` to apply a saved look without replacing the selected audio or output path
+
+CLI workflow:
+
+- pass `--preset path\to\preset.json` to apply a visual preset
+- if both are used, `--project` loads the full setup first and `--preset` applies the visual preset on top
+- explicit CLI arguments still override loaded project or preset values
+
+Minimal example:
+
+```powershell
+python -m cymatesserae ".\input.wav" --preset ".\my-look.json"
+```
+
+Paths are saved relative to the preset file when practical and resolved again from the preset file location when the preset is loaded.
 
 ---
 
@@ -248,17 +286,44 @@ When `--chroma-key-color` is set:
 
 ## Project Structure
 
+- `cymatesserae/renderer.py`  
+  compatibility/orchestration facade with `render_project()`
+
+- `cymatesserae/config.py`  
+  render and layer dataclasses
+
+- `cymatesserae/audio_analysis.py`  
+  audio loading, analysis, beat/features, and the Python 3.13 fallback path
+
+- `cymatesserae/styles.py`  
+  style presets, palettes, and background/style morph helpers
+
+- `cymatesserae/geometry.py`  
+  point, grid, cymatic layout, and runtime layer prep helpers
+
+- `cymatesserae/drawing/`  
+  visual-family drawing and compositing
+
+- `cymatesserae/export.py`  
+  FFmpeg setup and raw-frame export helpers
+
+- `cymatesserae/project_io.py`  
+  JSON project save/load
+
+- `cymatesserae/shared.py`  
+  shared path, color, dimension, and app-state helpers
+
 - `cymatesserae/cli.py`  
-  command-line entry point
+  CLI parsing and config assembly
 
 - `cymatesserae/gui.py`  
-  desktop control panel
-
-- `cymatesserae/renderer.py`  
-  audio analysis, motion system, and rendering/export pipeline
+  Tkinter control panel, paint editor, and save/load project UI
 
 - `requirements.txt`  
-  Python dependencies
+  runtime Python dependencies
+
+- `requirements-dev.txt`  
+  development-only test dependencies
 
 ---
 

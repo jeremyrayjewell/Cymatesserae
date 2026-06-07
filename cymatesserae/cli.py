@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .project_io import graphic_layer_from_dict, load_project_file
+from .project_io import graphic_layer_from_dict, load_preset_file, load_project_file
 from .shared import normalize_output_path, normalize_video_dimension, parse_chroma_key_color
 
 if TYPE_CHECKING:
@@ -35,6 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--project",
         type=Path,
         help="Optional JSON project file containing reproducible render and layer settings.",
+        default=None,
+    )
+    parser.add_argument(
+        "--preset",
+        type=Path,
+        help="Optional JSON visual preset file applied on top of normal CLI or project settings.",
         default=None,
     )
     parser.add_argument(
@@ -262,6 +268,13 @@ def main() -> int:
     from .renderer import RenderConfig, render_project
 
     base = project_config or RenderConfig(audio_path=audio_arg, output_path=Path("cymatesserae_output.mp4"))
+    if args.preset is not None:
+        try:
+            base = load_preset_file(args.preset, base)
+        except FileNotFoundError:
+            raise SystemExit(f"Could not load preset file: file not found: {args.preset}")
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"Could not load preset file: {exc}")
     preview_only = bool(args.preview_only) if args.preview_only is not None else base.preview_only
     preview = (bool(args.preview) if args.preview is not None else base.preview) or preview_only
     graphic_layers = load_graphic_layers(args.graphics_config) if args.graphics_config is not None else base.graphic_layers

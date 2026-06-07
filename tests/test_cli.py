@@ -150,6 +150,51 @@ def test_cli_main_project_values_can_be_overridden(monkeypatch, tmp_path: Path, 
     assert config.output_path == (tmp_path / "override.mp4")
 
 
+def test_cli_main_applies_preset_without_replacing_audio_or_output(monkeypatch, tmp_path: Path, generated_wav: Path) -> None:
+    from cymatesserae.project_io import save_preset_file
+
+    preset_path = tmp_path / "preset.json"
+    captured: dict[str, object] = {}
+
+    def fake_render_project(config) -> None:
+        captured["config"] = config
+
+    save_preset_file(
+        preset_path,
+        RenderConfig(
+            audio_path=tmp_path / "ignored.wav",
+            output_path=tmp_path / "ignored.mp4",
+            point_count=88,
+            cymatic_mode=True,
+            style_a="glass",
+            style_b="monolith",
+        ),
+    )
+
+    monkeypatch.setattr("cymatesserae.renderer.render_project", fake_render_project)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "cymatesserae",
+            str(generated_wav),
+            "--output",
+            str(tmp_path / "render.mp4"),
+            "--preset",
+            str(preset_path),
+        ],
+    )
+
+    cli.main()
+    config = captured["config"]
+
+    assert config.audio_path == generated_wav
+    assert config.output_path == (tmp_path / "render.mp4")
+    assert config.point_count == 88
+    assert config.cymatic_mode is True
+    assert config.style_a == "glass"
+    assert config.style_b == "monolith"
+
+
 def test_cli_main_project_load_errors_are_friendly_for_missing_file(monkeypatch, tmp_path: Path) -> None:
     missing = tmp_path / "missing.json"
     monkeypatch.setattr("sys.argv", ["cymatesserae", "--project", str(missing)])
