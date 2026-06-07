@@ -56,6 +56,12 @@ Preview from the CLI:
 python -m cymatesserae ".\input.wav" --preview --cymatic
 ```
 
+Load a saved project from the CLI:
+
+```powershell
+python -m cymatesserae --project ".\my-project.json"
+```
+
 Export an MP4:
 
 ```powershell
@@ -125,9 +131,43 @@ The GUI includes controls for:
 - beat-driven graphic switching
 - chroma-key background color
 
+It also supports:
+
+- `Save Project` for writing the current render and channel setup to a JSON project file
+- `Load Project` for restoring a saved project file into the current controls
+
 If a GUI render fails, the latest run is logged to:
 
 `cymatesserae_gui_last_run.log`
+
+---
+
+## Project Files
+
+Cymatesserae can save and load JSON-based project files for reproducible setups.
+
+Project files store:
+
+- render settings such as audio path, output path, size, FPS, duration, point count, cymatic mode, and other render controls
+- per-layer visual settings such as enabled channels, graphic cycles, styles, grid/layout options, response settings, and custom element paths
+
+When practical, paths are written relative to the project file location and resolved again when the project is loaded.
+
+GUI workflow:
+
+- use `Save Project` to capture the current setup
+- use `Load Project` to restore a saved setup
+
+CLI workflow:
+
+- pass `--project path\to\project.json` to load a saved project
+- normal CLI usage without `--project` still works as before
+
+Minimal example:
+
+```powershell
+python -m cymatesserae --project ".\my-project.json"
+```
 
 ---
 
