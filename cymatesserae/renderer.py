@@ -11,6 +11,7 @@ from .config import GraphicLayerConfig, LayerRuntimeState, RenderConfig
 from .drawing import apply_channel_composite, draw_graphic_family
 from .export import open_ffmpeg, require_ffmpeg, surface_to_frame
 from .geometry import (
+    GRAPHIC_TYPES,
     build_layer_runtime,
     cymatic_force,
     effective_graphic_layers,
@@ -19,7 +20,7 @@ from .geometry import (
     resolve_track_families,
     prepare_layers,
 )
-from .styles import ActiveStyle, StylePreset, activate_style, compute_style_mix, frame_background
+from .styles import ActiveStyle, STYLE_PRESETS, StylePreset, activate_style, compute_style_mix, frame_background
 
 
 def _emit_status(message: str) -> None:
@@ -318,9 +319,13 @@ __all__ = [
     "ActiveStyle",
     "AudioFeatureTimeline",
     "AudioSnapshot",
+    "GRAPHIC_TYPES",
     "GraphicLayerConfig",
     "LayerRuntimeState",
     "RenderConfig",
+    "STYLE_PRESETS",
     "StylePreset",
+    "analyze_audio",
+    "open_ffmpeg",
     "render_project",
 ]
